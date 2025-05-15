@@ -3,7 +3,8 @@ import os
 from tqdm import tqdm
 
 import torch
-from torchtext.data import Field
+# Import our custom Field implementation instead of using torchtext's
+from onmt.inputters.inputter import Field
 
 from onmt.inputters.datareader_base import DataReaderBase
 
