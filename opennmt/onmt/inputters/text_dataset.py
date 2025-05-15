@@ -3,7 +3,25 @@ from functools import partial
 
 import six
 import torch
-from torchtext.data import RawField
+
+# Create RawField class instead of importing from torchtext.data
+class RawField:
+    """
+    A Raw Field handles data that will not be processed by the main Field
+    infrastructure. This is necessary for fields like the target sequence
+    or fields used for sidechannel information.
+    """
+    def __init__(self):
+        self.is_target = False
+    
+    def preprocess(self, x):
+        return x
+    
+    def process(self, batch, device=None):
+        return batch
+    
+    def __call__(self, mini_batch):
+        return mini_batch
 
 # Import our custom Field implementation instead of using torchtext's
 from onmt.inputters.inputter import Field
