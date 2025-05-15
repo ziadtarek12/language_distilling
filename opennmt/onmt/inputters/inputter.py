@@ -8,9 +8,10 @@ from collections import Counter, defaultdict
 from itertools import chain, cycle
 
 import torch
-import torchtext.data
-from torchtext.data import Field
-from torchtext.vocab import Vocab
+# Import from legacy to handle deprecation
+import torchtext.legacy.data
+from torchtext.legacy.data import Field
+from torchtext.legacy.vocab import Vocab
 
 from onmt.inputters.text_dataset import text_fields, TextMultiField
 from onmt.inputters.image_dataset import image_fields
@@ -23,6 +24,9 @@ from onmt.inputters.image_dataset import (  # noqa: F401
 
 import gc
 
+# Add a warning suppression for torchtext deprecation
+import torchtext
+torchtext.disable_torchtext_deprecation_warning()
 
 # monkey-patch to make torchtext Vocab's pickleable
 def _getstate(self):
@@ -483,7 +487,7 @@ def batch_iter(data, batch_size, batch_size_fn=None, batch_size_multiple=1):
         yield minibatch
 
 
-class OrderedIterator(torchtext.data.Iterator):
+class OrderedIterator(torchtext.legacy.data.Iterator):
 
     def __init__(self,
                  dataset,
@@ -496,7 +500,7 @@ class OrderedIterator(torchtext.data.Iterator):
     def create_batches(self):
         if self.train:
             def _pool(data, random_shuffler):
-                for p in torchtext.data.batch(data, self.batch_size * 100):
+                for p in torchtext.legacy.data.batch(data, self.batch_size * 100):
                     p_batch = batch_iter(
                         sorted(p, key=self.sort_key),
                         self.batch_size,
