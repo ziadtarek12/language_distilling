@@ -543,7 +543,7 @@ def batch_iter(data, batch_size, batch_size_fn=None, batch_size_multiple=1):
         yield minibatch
 
 
-class OrderedIterator(torchtext.legacy.data.Iterator):
+class OrderedIterator(torchtext.data.Iterator):
 
     def __init__(self,
                  dataset,
