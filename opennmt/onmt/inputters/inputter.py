@@ -8,10 +8,70 @@ from collections import Counter, defaultdict
 from itertools import chain, cycle
 
 import torch
-# Import from legacy to handle deprecation
-import torchtext.legacy.data
-from torchtext.legacy.data import Field
-from torchtext.legacy.vocab import Vocab
+import torchtext
+from torch.nn.utils.rnn import pad_sequence
+
+# Disable torchtext deprecation warning
+import warnings
+warnings.filterwarnings('ignore', message='.*torchtext.*')
+
+# Create Field class replacement
+class Field:
+    def __init__(self, use_vocab=True, dtype=torch.long, sequential=True, 
+                 init_token=None, eos_token=None, pad_token=None, unk_token=None,
+                 postprocessing=None, include_lengths=False, batch_first=False):
+        self.use_vocab = use_vocab
+        self.dtype = dtype
+        self.sequential = sequential
+        self.init_token = init_token
+        self.eos_token = eos_token
+        self.pad_token = pad_token
+        self.unk_token = unk_token
+        self.postprocessing = postprocessing
+        self.include_lengths = include_lengths
+        self.batch_first = batch_first
+        self.vocab = None
+    
+    def vocab_cls(self, counter, **kwargs):
+        return Vocab(counter, **kwargs)
+
+# Create Vocab class replacement
+class Vocab:
+    def __init__(self, counter, specials=None, max_size=None, min_freq=1):
+        self.freqs = counter
+        self.itos = []
+        self.stoi = defaultdict(lambda: 0)
+        
+        # Add special tokens
+        if specials is not None:
+            for token in specials:
+                if token is not None and token not in self.itos:
+                    self.itos.append(token)
+        
+        # Add tokens from counter
+        for token, count in sorted(counter.items(), key=lambda x: (-x[1], x[0])):
+            if token not in self.itos:
+                if max_size is not None and len(self.itos) >= max_size:
+                    break
+                if min_freq > 1 and count < min_freq:
+                    break
+                self.itos.append(token)
+        
+        # Create stoi mapping
+        for i, token in enumerate(self.itos):
+            self.stoi[token] = i
+    
+    def __getitem__(self, token):
+        return self.stoi[token]
+    
+    def __len__(self):
+        return len(self.itos)
+    
+    def extend(self, v):
+        self.itos.extend(v.itos)
+        for token in v.itos:
+            if token not in self.stoi:
+                self.stoi[token] = len(self.stoi)
 
 from onmt.inputters.text_dataset import text_fields, TextMultiField
 from onmt.inputters.image_dataset import image_fields
@@ -23,10 +83,6 @@ from onmt.inputters.image_dataset import (  # noqa: F401
     batch_img as make_img)
 
 import gc
-
-# Add a warning suppression for torchtext deprecation
-import torchtext
-torchtext.disable_torchtext_deprecation_warning()
 
 # monkey-patch to make torchtext Vocab's pickleable
 def _getstate(self):
