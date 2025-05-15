@@ -9,7 +9,7 @@ from itertools import chain, cycle
 
 import torch
 import torchtext.data
-from torchtext.data import Field
+from torchtext.legacy.data import Field
 from torchtext.vocab import Vocab
 
 from onmt.inputters.text_dataset import text_fields, TextMultiField
