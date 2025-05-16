@@ -77,26 +77,67 @@ class BertForSeq2seq(BertForMaskedLM):
         if vocab_size % 8 != 0:
             # pad for tensor cores
             vocab_size += (8 - vocab_size % 8)
+            
+        # Get embedding dimensions and hidden size
         emb_dim = self.cls.predictions.decoder.weight.size(1)
-        self.cls.predictions.decoder.weight = nn.Parameter(
-            torch.Tensor(vocab_size, emb_dim))
-        self.cls.predictions.bias = nn.Parameter(torch.zeros(vocab_size))
+        hidden_size = self.config.hidden_size
+        
+        # We need to recreate the entire prediction head to ensure dimension consistency
+        # First, ensure transform layer is correct (dense layer that transforms hidden states)
+        if hasattr(self.cls.predictions, 'transform'):
+            # Make sure transform's output dimension matches hidden_size
+            self.cls.predictions.transform.dense = nn.Linear(hidden_size, hidden_size)
+            # Initialize weights properly
+            self.cls.predictions.transform.dense.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            self.cls.predictions.transform.dense.bias.data.zero_()
+        
+        # Create new decoder layer with correct dimensions
+        self.cls.predictions.decoder = nn.Linear(hidden_size, vocab_size, bias=True)
+        self.cls.predictions.decoder.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        self.cls.predictions.bias = self.cls.predictions.decoder.bias
+        self.cls.predictions.bias.data.zero_()
+        
+        # Update config
         self.config.vocab_size = vocab_size
 
     def update_embedding_layer_by_size(self, vocab_size):
         if vocab_size % 8 != 0:
             # pad for tensor cores
             vocab_size += (8 - vocab_size % 8)
+        
+        # Get embedding dimensions from existing model
         emb_dim = self.cls.predictions.decoder.weight.size(1)
-        self.bert.embeddings.word_embeddings = nn.Embedding(
-            vocab_size, emb_dim, padding_idx=0)
+        hidden_size = self.config.hidden_size
         
-        # Also update the decoder weight to match the new vocab size
-        # This is necessary to maintain dimension compatibility
-        self.cls.predictions.decoder.weight = nn.Parameter(
-            torch.Tensor(vocab_size, emb_dim))
-        self.cls.predictions.bias = nn.Parameter(torch.zeros(vocab_size))
+        # Create new embedding with proper initialization
+        new_embeddings = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
+        # Initialize with same distribution as original embeddings
+        new_embeddings.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         
+        # Transfer embeddings for tokens that exist in both vocabularies (up to min size)
+        old_embeddings = self.bert.embeddings.word_embeddings
+        min_vocab_size = min(old_embeddings.weight.size(0), vocab_size)
+        new_embeddings.weight.data[:min_vocab_size] = old_embeddings.weight.data[:min_vocab_size]
+        
+        # Update model embeddings
+        self.bert.embeddings.word_embeddings = new_embeddings
+        
+        # We need to recreate the entire prediction head to ensure dimension consistency
+        # First, ensure transform layer is correct (dense layer that transforms hidden states)
+        if hasattr(self.cls.predictions, 'transform'):
+            # Make sure transform's output dimension matches hidden_size
+            self.cls.predictions.transform.dense = nn.Linear(hidden_size, hidden_size)
+            # Initialize weights properly
+            self.cls.predictions.transform.dense.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            self.cls.predictions.transform.dense.bias.data.zero_()
+            
+        # Update decoder with correct dimensions
+        self.cls.predictions.decoder = nn.Linear(hidden_size, vocab_size, bias=True)
+        self.cls.predictions.decoder.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        self.cls.predictions.bias = self.cls.predictions.decoder.bias
+        self.cls.predictions.bias.data.zero_()
+        
+        # Update config
         self.config.vocab_size = vocab_size
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
