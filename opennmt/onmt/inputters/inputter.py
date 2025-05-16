@@ -543,24 +543,61 @@ def batch_iter(data, batch_size, batch_size_fn=None, batch_size_multiple=1):
         yield minibatch
 
 
-class OrderedIterator(torchtext.data.Iterator):
+class OrderedIterator(object):
+    """Ordered Iterator class that mimics the functionality of torchtext.data.Iterator
+    but works with newer versions of torchtext where Iterator is no longer available.
+    """
 
     def __init__(self,
                  dataset,
                  batch_size,
+                 device=None,
                  batch_size_multiple=1,
-                 **kwargs):
-        super(OrderedIterator, self).__init__(dataset, batch_size, **kwargs)
+                 train=True,
+                 repeat=False,
+                 sort=None,
+                 sort_within_batch=None,
+                 sort_key=None,
+                 random_shuffler=None):
+        self.dataset = dataset
+        self.batch_size = batch_size
         self.batch_size_multiple = batch_size_multiple
+        self.device = device
+        self.train = train
+        self.repeat = repeat
+        self.sort = sort
+        self.sort_within_batch = sort_within_batch
+        self.sort_key = sort_key
+        self.random_shuffler = random_shuffler
+        if random_shuffler is None:
+            self.random_shuffler = lambda x: random.shuffle(x)
+        self.batches = None
+        self.create_batches()
+
+    def data(self):
+        if self.repeat:
+            def _data():
+                dataset_iter = iter(self.dataset)
+                while True:
+                    try:
+                        item = next(dataset_iter)
+                        yield item
+                    except StopIteration:
+                        dataset_iter = iter(self.dataset)
+                        item = next(dataset_iter)
+                        yield item
+            return _data()
+        else:
+            return iter(self.dataset)
 
     def create_batches(self):
         if self.train:
             def _pool(data, random_shuffler):
-                for p in torchtext.data.batch(data, self.batch_size * 100):
+                for p in batch(data, self.batch_size * 100):
                     p_batch = batch_iter(
                         sorted(p, key=self.sort_key),
                         self.batch_size,
-                        batch_size_fn=self.batch_size_fn,
+                        batch_size_fn=self.batch_size_fn if hasattr(self, 'batch_size_fn') else None,
                         batch_size_multiple=self.batch_size_multiple)
                     for b in random_shuffler(list(p_batch)):
                         yield b
@@ -571,9 +608,36 @@ class OrderedIterator(torchtext.data.Iterator):
             for b in batch_iter(
                     self.data(),
                     self.batch_size,
-                    batch_size_fn=self.batch_size_fn,
+                    batch_size_fn=self.batch_size_fn if hasattr(self, 'batch_size_fn') else None,
                     batch_size_multiple=self.batch_size_multiple):
-                self.batches.append(sorted(b, key=self.sort_key))
+                self.batches.append(sorted(b, key=self.sort_key) if self.sort_key else b)
+
+    def __iter__(self):
+        if self.batches is None:
+            self.create_batches()
+        if self.sort:
+            if self.sort_within_batch:
+                return (sorted(b, key=self.sort_key) for b in self.batches)
+            else:
+                return (b for b in self.batches)
+        else:
+            return (b for b in self.batches)
+
+    def __len__(self):
+        if self.batches is None:
+            self.create_batches()
+        return len(self.batches)
+
+def batch(data, batch_size):
+    """Yield elements from data in chunks of batch_size."""
+    minibatch = []
+    for ex in data:
+        minibatch.append(ex)
+        if len(minibatch) == batch_size:
+            yield minibatch
+            minibatch = []
+    if minibatch:
+        yield minibatch
 
 
 class DatasetLazyIter(object):
