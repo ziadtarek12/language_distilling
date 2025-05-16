@@ -90,6 +90,13 @@ class BertForSeq2seq(BertForMaskedLM):
         emb_dim = self.cls.predictions.decoder.weight.size(1)
         self.bert.embeddings.word_embeddings = nn.Embedding(
             vocab_size, emb_dim, padding_idx=0)
+        
+        # Also update the decoder weight to match the new vocab size
+        # This is necessary to maintain dimension compatibility
+        self.cls.predictions.decoder.weight = nn.Parameter(
+            torch.Tensor(vocab_size, emb_dim))
+        self.cls.predictions.bias = nn.Parameter(torch.zeros(vocab_size))
+        
         self.config.vocab_size = vocab_size
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
