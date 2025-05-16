@@ -10,12 +10,14 @@ import io
 import os
 import pickle
 import codecs
+import sys
+import types
 from collections import Counter, defaultdict
 
 class Vocab:
     """Replacement for OpenNMT's Vocab class to avoid problematic imports."""
-    def __init__(self, counter, specials=None, max_size=None, min_freq=1):
-        self.freqs = counter
+    def __init__(self, counter=None, specials=None, max_size=None, min_freq=1):
+        self.freqs = counter or Counter()
         self.itos = []
         self.stoi = defaultdict(lambda: 0)
         
@@ -26,7 +28,7 @@ class Vocab:
                     self.itos.append(token)
         
         # Add tokens from counter
-        for token, count in sorted(counter.items(), key=lambda x: (-x[1], x[0])):
+        for token, count in sorted(self.freqs.items(), key=lambda x: (-x[1], x[0])):
             if token not in self.itos:
                 if max_size is not None and len(self.itos) >= max_size:
                     break
@@ -46,26 +48,31 @@ class Vocab:
 
 class Field:
     """Replacement for OpenNMT's Field class."""
-    def __init__(self, pad_token=None, unk_token=None, init_token=None, eos_token=None):
+    def __init__(self, vocab=None, pad_token=None, unk_token=None, init_token=None, eos_token=None):
         self.pad_token = pad_token
         self.unk_token = unk_token
         self.init_token = init_token
         self.eos_token = eos_token
-        self.vocab = None
+        self.vocab = vocab or Vocab()
         self.use_vocab = True
         self.sequential = True
 
-def _getstate(obj):
-    """Custom getstate for pickling Vocab objects."""
-    return dict(obj.__dict__, stoi=dict(obj.stoi))
-
-def _setstate(obj, state):
-    """Custom setstate for unpickling Vocab objects."""
-    obj.__dict__.update(state)
-    obj.stoi = defaultdict(lambda: 0, obj.stoi)
+class TextMultiField:
+    """Replacement for OpenNMT's TextMultiField class."""
+    def __init__(self, base_name, fields):
+        self.base_name = base_name
+        self.fields = fields
 
 def safe_load_vocab(path):
+    """
+    Safely load an OpenNMT vocabulary file without triggering problematic imports.
     
+    Args:
+        path (str): Path to the vocabulary file (.pt)
+        
+    Returns:
+        dict: The loaded vocabulary dictionary
+    """
     # Create a custom unpickler that replaces OpenNMT vocab classes with our own
     class CustomUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
@@ -73,12 +80,29 @@ def safe_load_vocab(path):
                 return Vocab
             if module == 'torchtext.data.field' and name == 'Field':
                 return Field
+            if module == 'torchtext.data.field' and name == 'TextMultiField':
+                return TextMultiField
+            
+            # For all other module/name combinations, try the normal approach
             try:
-                return super().find_class(module, name)
-            except (ImportError, AttributeError):
-                # Create a dummy class for any problematic imports
-                dummy_class = type(name, (), {})
-                return dummy_class
+                if module == "__builtin__" and name == "str":
+                    return str
+                if module == "__builtin__" and name == "object":
+                    return object
+                
+                # Try to import the module and get the attribute
+                __import__(module, level=0)
+                mod = sys.modules.get(module, None)
+                if mod is not None:
+                    return getattr(mod, name)
+                
+            except (ImportError, AttributeError, KeyError):
+                # If we can't import, create a dummy class
+                pass
+                
+            # Create a dummy class for any problematic imports
+            dummy_class = type(name, (), {})
+            return dummy_class
     
     # Load the vocabulary using our custom unpickler
     try:
@@ -89,17 +113,30 @@ def safe_load_vocab(path):
     except Exception as e:
         print(f"Error with custom unpickler: {e}")
         
-        # Fall back to torch.load with a custom function for handling missing classes
-        def _custom_load(obj_class):
-            return type(obj_class.__name__, (), {})
+        # Fall back to torch.load with a pickle_module argument that handles missing modules
+        class CustomPickleModule:
+            @staticmethod
+            def load(file_obj, **kwargs):
+                return CustomUnpickler(file_obj).load()
+            
+            # Add other required pickle methods
+            @staticmethod
+            def loads(data, **kwargs):
+                file_obj = io.BytesIO(data)
+                return CustomUnpickler(file_obj).load()
         
         try:
-            return torch.load(path, pickle_module=pickle, 
-                             pickle_load_args={"encoding": "utf-8"},
-                             map_location='cpu')
+            return torch.load(path, pickle_module=CustomPickleModule, 
+                            map_location='cpu')
         except Exception as e2:
             print(f"Error with torch.load fallback: {e2}")
-            raise
+            
+            # Last resort: try to load with default pickle but catch errors
+            try:
+                return torch.load(path, map_location='cpu')
+            except Exception as e3:
+                print(f"All loading methods failed: {e3}")
+                raise
 
 if __name__ == "__main__":
     # Example usage
@@ -109,6 +146,9 @@ if __name__ == "__main__":
         print(f"Loading vocabulary from {vocab_file}")
         vocab = safe_load_vocab(vocab_file)
         print(f"Vocabulary loaded successfully")
-        print(f"Fields: {list(vocab.keys())}")
+        if isinstance(vocab, dict):
+            print(f"Fields: {list(vocab.keys())}")
+        else:
+            print(f"Vocab type: {type(vocab)}")
     else:
         print("Usage: python vocab_loader.py <path_to_vocab.pt>")
