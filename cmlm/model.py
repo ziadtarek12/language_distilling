@@ -16,11 +16,20 @@ IN_WORD = '@@'
 
 def convert_embedding(toker, vocab, emb_weight):
     """ seq2seq vs pretrained BERT embedding conversion"""
-    vocab_size = emb_weight.size(1)
+    # Check if the embedding weight is 1D or 2D
+    if len(emb_weight.shape) == 2:
+        # Standard case: [vocab_size, embedding_dim]
+        vocab_size = emb_weight.size(0)  # Changed from size(1) to size(0)
+        embedding_dim = emb_weight.size(1)
+    else:
+        # Handle unexpected shape
+        raise ValueError(f"Unexpected embedding weight shape: {emb_weight.shape}")
+    
     if vocab_size % 8 != 0:
         # pad for tensor cores
         vocab_size += (8 - vocab_size % 8)
-    vectors = [torch.zeros(vocab_size) for _ in range(len(vocab))]
+        
+    vectors = [torch.zeros(embedding_dim) for _ in range(len(vocab))]  # Create vectors with embedding_dim
     for word, id_ in vocab.items():
         word = word.replace(IN_WORD, '')
         if word in toker.vocab:
