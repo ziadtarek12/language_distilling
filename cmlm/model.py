@@ -6,8 +6,9 @@ C-MLM model
 """
 import torch
 from torch import nn
-# Update import to use transformers instead of pytorch_pretrained_bert
-from transformers import BertForMaskedLM
+
+# Import our compatibility layer instead of directly importing from transformers
+from compat_torch import BertForMaskedLM
 
 
 IN_WORD = '@@'

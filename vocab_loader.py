@@ -12,6 +12,7 @@ import sys
 import pickle
 import codecs
 from collections import Counter, defaultdict
+import warnings
 
 class Vocab:
     """Replacement for OpenNMT's Vocab class to avoid problematic imports."""
@@ -71,95 +72,57 @@ def _setstate(obj, state):
     obj.__dict__.update(state)
     obj.stoi = defaultdict(lambda: 0, obj.stoi)
 
-def safe_load_vocab(path):
+def safe_load_vocab(vocab_file):
     """
-    Safely load an OpenNMT vocabulary file without triggering problematic imports.
+    Safely load vocabulary files that might have been saved with a different PyTorch version.
     
     Args:
-        path (str): Path to the vocabulary file (.pt)
+        vocab_file: Path to the vocabulary file
         
     Returns:
-        dict: The loaded vocabulary dictionary
+        Loaded vocabulary dictionary
     """
-    # Create a custom unpickler by using pickle.Unpickler as a function, not trying to subclass it
+    if not os.path.exists(vocab_file):
+        raise FileNotFoundError(f"Vocabulary file not found: {vocab_file}")
+    
+    # Try multiple loading methods to handle version differences
     try:
-        # First try our custom unpickler approach
-        with open(path, 'rb') as f:
-            unpickler = pickle.Unpickler(f)
-            
-            # Save the original find_class
-            original_find_class = unpickler.find_class
-            
-            # Define a custom find_class function
-            def custom_find_class(module, name):
-                if module == 'onmt.inputters.inputter' and name == 'Vocab':
-                    return Vocab
-                if module == 'torchtext.data.field' and name == 'Field':
-                    return Field
-                if module == 'torchtext.data.field' and name == 'TextMultiField':
-                    return TextMultiField
-                
-                # For all other module/name combinations, try the normal approach
-                try:
-                    if module == "__builtin__" and name == "str":
-                        return str
-                    if module == "__builtin__" and name == "object":
-                        return object
-                    
-                    # Try to import the module and get the attribute
-                    __import__(module, level=0)
-                    mod = sys.modules.get(module, None)
-                    if mod is not None:
-                        return getattr(mod, name)
-                    
-                except (ImportError, AttributeError, KeyError):
-                    # If we can't import, create a dummy class
-                    pass
-                    
-                # Create a dummy class for any problematic imports
-                dummy_class = type(name, (), {})
-                return dummy_class
-            
-            # Replace the find_class method with our custom one
-            unpickler.find_class = custom_find_class
-            
-            # Load the vocabulary
-            vocab = unpickler.load()
-            return vocab
-            
-    except Exception as e:
-        print(f"Error with custom unpickler: {e}")
+        # Method 1: Standard torch.load
+        return torch.load(vocab_file)
+    except Exception as e1:
+        warnings.warn(f"Standard loading failed: {e1}. Trying alternative methods...")
         
-        # Fall back to torch.load with a custom function that skips problematic modules
         try:
-            # Define a simple loader function to use with torch.load
-            def custom_loader(obj_str):
-                try:
-                    return pickle.loads(obj_str)
-                except Exception:
-                    # Return an empty dictionary if unpickling fails
-                    return {}
-                    
-            return torch.load(path, map_location='cpu')
+            # Method 2: Using pickle directly
+            with open(vocab_file, 'rb') as f:
+                return pickle.load(f)
         except Exception as e2:
-            print(f"Error with torch.load fallback: {e2}")
+            warnings.warn(f"Pickle loading failed: {e2}. Trying legacy loading...")
             
-            # Last resort: try a direct approach with a custom pickle mapping
             try:
-                data = torch.load(path, map_location=lambda storage, loc: storage)
-                return data
+                # Method 3: Using torch.load with map_location and encoding handling
+                return torch.load(
+                    vocab_file, 
+                    map_location=lambda storage, loc: storage,
+                    pickle_module=pickle
+                )
             except Exception as e3:
-                print(f"All attempts to load vocabulary failed: {e3}")
-                raise ValueError(f"Could not load vocabulary from {path}")
+                # Last resort: Try to handle binary compatibility issues
+                warnings.warn(f"Legacy loading failed: {e3}. Using byte-level compatibility handling...")
+                
+                try:
+                    # Method 4: Byte-level compatibility handling
+                    with open(vocab_file, 'rb') as f:
+                        buffer = io.BytesIO(f.read())
+                        return torch.load(buffer)
+                except Exception as e4:
+                    raise RuntimeError(f"All loading methods failed. Last error: {e4}")
 
 if __name__ == "__main__":
     # Example usage
     import sys
-    if len(sys.argv) > 1:
-        vocab_file = sys.argv[1]
-        print(f"Loading vocabulary from {vocab_file}")
-        vocab = safe_load_vocab(vocab_file)
-        print(f"Vocabulary loaded successfully")
-        print(f"Fields: {list(vocab.keys())}")
-    else:
-        print("Usage: python vocab_loader.py <path_to_vocab.pt>")
+   
+    
+    vocab = safe_load_vocab("requirements.txt")
+    print(f"Vocabulary loaded successfully")
+    print(f"Fields: {list(vocab.keys())}")
