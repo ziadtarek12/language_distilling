@@ -13,7 +13,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from pytorch_pretrained_bert import BertTokenizer
+# Update import to use transformers instead of pytorch_pretrained_bert
+from transformers import BertTokenizer
 from toolz.sandbox import unzip
 
 from cmlm.model import BertForSeq2seq
@@ -67,18 +68,21 @@ def convert_example(src, tgt, toker, num_samples):
     # build the random masks
     tgt_len = len(tgt)
     if tgt_len <= num_samples:
-        masks = torch.eye(tgt_len).byte()
+        # Update byte() to bool() for PyTorch 2.x compatibility
+        masks = torch.eye(tgt_len).bool()
         num_samples = tgt_len
     else:
         mask_inds = [list(range(i, tgt_len, num_samples))
                      for i in range(num_samples)]
-        masks = torch.zeros(num_samples, tgt_len).byte()
+        # Update byte() to bool() for PyTorch 2.x compatibility
+        masks = torch.zeros(num_samples, tgt_len).bool()
         for i, indices in enumerate(mask_inds):
             for j in indices:
                 masks.data[i, j] = 1
     assert (masks.sum(dim=0) != torch.ones(tgt_len).long()).sum().item() == 0
     assert masks.sum().item() == tgt_len
-    masks = torch.cat([torch.zeros(num_samples, len(src)+2).byte(), masks],
+    # Update byte() to bool() for PyTorch 2.x compatibility
+    masks = torch.cat([torch.zeros(num_samples, len(src)+2).bool(), masks],
                       dim=1)
 
     # make BERT inputs
@@ -113,9 +117,14 @@ def process_batch(batch, bert, toker, num_samples=7):
     input_ids = input_ids.cuda()
     token_ids = token_ids.cuda()
     attn_mask = attn_mask.cuda()
-    hiddens, _ = bert.bert(input_ids, token_ids, attn_mask,
-                           output_all_encoded_layers=False)
+    
+    # Updated to use the new transformers API
+    outputs = bert.bert(input_ids=input_ids, 
+                        token_type_ids=token_ids, 
+                        attention_mask=attn_mask)
+    hiddens = outputs.last_hidden_state
     hiddens = bert.cls.predictions.transform(hiddens)
+    
     i = 0
     outputs = []
     for masks in all_masks:
@@ -143,17 +152,21 @@ def main(opts):
     # load BERT
     state_dict = torch.load(opts.ckpt)
     vsize = state_dict['cls.predictions.decoder.weight'].size(0)
-    bert = BertForSeq2seq.from_pretrained(opts.bert).eval().half().cuda()
+    
+    # Updated to use new from_pretrained method from transformers
+    bert = BertForSeq2seq.from_pretrained(opts.bert)
     bert.update_output_layer_by_size(vsize)
     bert.load_state_dict(state_dict)
+    bert.eval().half().cuda()
+    
     toker = BertTokenizer.from_pretrained(opts.bert,
-                                          do_lower_case='uncased' in opts.bert)
+                                         do_lower_case='uncased' in opts.bert)
 
     # save the final projection layer
     linear = torch.nn.Linear(bert.config.hidden_size, bert.config.vocab_size)
     linear.weight.data = state_dict['cls.predictions.decoder.weight']
     linear.bias.data = state_dict['cls.predictions.bias']
-    os.makedirs(opts.output)
+    os.makedirs(opts.output, exist_ok=True)
     torch.save(linear, f'{opts.output}/linear.pt')
 
     # create DB

@@ -45,13 +45,88 @@ from cmlm.model import convert_embedding, BertForSeq2seq
 from cmlm.util import Logger, RunningMeter
 from cmlm.distributed import broadcast_tensors
 
-# add opennmt to python module search path
-# other than distributed utils, this is also needed to load onmt vocab file
-import sys
-sys.path.insert(0, '/src/opennmt')
-from opennmt.onmt.utils.distributed import (all_reduce_and_rescale_tensors,
-                                    all_gather_list)
+# Custom distributed utilities to avoid importing problematic modules
+# This replaces the original import from opennmt.onmt.utils.distributed
+def all_reduce_and_rescale_tensors(tensors, rescale_denom, buffer_size=10485760):
+    """All-reduce and rescale tensors in chunks of the specified size."""
+    # Buffer for flattening tensors
+    buffer = torch.empty(buffer_size, dtype=torch.float32, device=tensors[0].device)
+    buffer_t = buffer
 
+    def all_reduce_buffer():
+        # copy tensors into buffer_t
+        offset = 0
+        for t in buffer:
+            numel = t.numel()
+            buffer_t[offset:offset+numel].copy_(t.view(-1))
+            offset += numel
+
+        # all-reduce and rescale
+        torch.distributed.all_reduce(buffer_t[:offset])
+        buffer_t.div_(rescale_denom)
+
+        # copy all-reduced buffer back into tensors
+        offset = 0
+        for t in buffer:
+            numel = t.numel()
+            t.view(-1).copy_(buffer_t[offset:offset+numel])
+            offset += numel
+
+    filled = 0
+    buffer = []
+    for t in tensors:
+        sz = t.numel() * t.element_size()
+        if sz > buffer_size:
+            # tensor is bigger than buffer, all-reduce and rescale directly
+            torch.distributed.all_reduce(t)
+            t.div_(rescale_denom)
+        elif filled + sz > buffer_size:
+            # buffer is full, all-reduce and rescale
+            all_reduce_buffer()
+            buffer = [t]
+            filled = sz
+        else:
+            # add tensor to buffer
+            buffer.append(t)
+            filled += sz
+
+    if len(buffer) > 0:
+        all_reduce_buffer()
+
+def all_gather_list(data, max_size=4096):
+    """Gathers arbitrary data from all nodes into a list."""
+    world_size = torch.distributed.get_world_size()
+    if world_size == 1:
+        return [data]
+
+    # serialized to a Tensor
+    buffer = torch.ByteTensor(max_size).to("cuda")
+    buffer.zero_()
+    
+    # Serialize the data to the buffer
+    import pickle
+    data_bytes = pickle.dumps(data)
+    size = len(data_bytes)
+    
+    if size + 4 > max_size:
+        raise ValueError('Data exceeds buffer size')
+    
+    # Pack the size at the start of the buffer
+    buffer[0:4].copy_(torch.ByteTensor([size]))
+    buffer[4:4+size].copy_(torch.ByteTensor(list(data_bytes)))
+    
+    # Gather all buffer data
+    gathered_buffers = [torch.empty_like(buffer) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_buffers, buffer)
+    
+    # Deserialize the gathered data
+    result = []
+    for buf in gathered_buffers:
+        size = int(buf[0:4].tolist()[0])
+        data_bytes = bytes(buf[4:4+size].tolist())
+        result.append(pickle.loads(data_bytes))
+    
+    return result
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -454,7 +529,7 @@ if __name__ == "__main__":
     parser.add_argument('--fp16',
                         action='store_true',
                         help="Whether to use 16-bit float precision instead "
-                             "of 32-bit")
+                             of 32-bit")
     parser.add_argument('--loss_scale', type=float, default=0,
                         help="Loss scaling to improve fp16 numeric stability. "
                              "Only used when fp16 set to True.\n"
