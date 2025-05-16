@@ -34,8 +34,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
+# Replace pytorch_pretrained_bert with transformers
+from transformers import BertTokenizer
+from transformers import AdamW, get_linear_schedule_with_warmup
 
 from cmlm.data import (BertDataset, TokenBucketSampler,
                        DistributedTokenBucketSampler,
@@ -64,6 +65,22 @@ def noam_schedule(step, warmup_step=4000):
     if step <= warmup_step:
         return step / warmup_step
     return (warmup_step ** 0.5) * (step ** -0.5)
+
+
+# Implement warmup_linear function since it's no longer in transformers
+def warmup_linear(x, warmup=0.002):
+    """Linear warmup and then linear decay.
+    
+    Args:
+        x: current step / total steps
+        warmup: proportion of warmup steps
+    
+    Returns:
+        Scaling factor for learning rate
+    """
+    if x < warmup:
+        return x/warmup
+    return max(0, (1.0 - x)/(1.0 - warmup))
 
 
 def main(opts):
@@ -160,10 +177,12 @@ def main(opts):
                                        static_loss_scale=opts.loss_scale)
 
     else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=opts.learning_rate,
-                             warmup=opts.warmup_proportion,
-                             t_total=opts.num_train_steps)
+        optimizer = AdamW(optimizer_grouped_parameters,
+                          lr=opts.learning_rate,
+                          correct_bias=False)
+        scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                    num_warmup_steps=int(opts.warmup_proportion * opts.num_train_steps),
+                                                    num_training_steps=opts.num_train_steps)
 
     global_step = 0
     logger.info("***** Running training *****")

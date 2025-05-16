@@ -6,7 +6,8 @@ C-MLM model
 """
 import torch
 from torch import nn
-from pytorch_pretrained_bert.modeling import BertForMaskedLM
+# Update import to use transformers instead of pytorch_pretrained_bert
+from transformers import BertForMaskedLM
 
 
 IN_WORD = '@@'
@@ -38,7 +39,23 @@ class BertForSeq2seq(BertForMaskedLM):
     """
     def __init__(self, config, causal=False):
         super().__init__(config)
-        self.apply(self.init_bert_weights)
+        # Update initialization method to be compatible with transformers
+        self._init_weights(self.cls)
+
+    # Add compatibility method for init_bert_weights which doesn't exist in new transformers
+    def _init_weights(self, module):
+        """ Initialize the weights """
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+    
+    def init_bert_weights(self, module):
+        """ Legacy method for backward compatibility """
+        return self._init_weights(module)
 
     def update_output_layer(self, output_embedding):
         self.cls.predictions.decoder.weight = output_embedding
@@ -69,15 +86,23 @@ class BertForSeq2seq(BertForMaskedLM):
                 masked_lm_labels=None, output_mask=None, do_padding=True):
         """ only computes masked logits to save some computation"""
         if output_mask is None:
-            # reduce to normal forward
-            return super().forward(input_ids, token_type_ids, attention_mask,
-                                   masked_lm_labels)
+            # In transformers library, masked_lm_labels is now labels
+            if masked_lm_labels is not None:
+                return super().forward(input_ids=input_ids, 
+                                    token_type_ids=token_type_ids, 
+                                    attention_mask=attention_mask,
+                                    labels=masked_lm_labels).loss
+            else:
+                return super().forward(input_ids=input_ids, 
+                                    token_type_ids=token_type_ids, 
+                                    attention_mask=attention_mask).logits
 
-        sequence_output, pooled_output = self.bert(
-            input_ids, token_type_ids, attention_mask,
-            output_all_encoded_layers=False)
+        # Get sequence output from the model's encoder
+        outputs = self.bert(input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
+        sequence_output = outputs.last_hidden_state
+        
         # only compute masked outputs
-        output_mask = output_mask.byte()
+        output_mask = output_mask.bool()  # byte() is deprecated, use bool() instead
         sequence_output_masked = sequence_output.masked_select(
             output_mask.unsqueeze(-1).expand_as(sequence_output)
         ).contiguous().view(-1, self.config.hidden_size)
