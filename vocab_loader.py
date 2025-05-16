@@ -8,6 +8,7 @@ with the OpenNMT codebase.
 import torch
 import io
 import os
+import pickle
 import codecs
 from collections import Counter, defaultdict
 
@@ -73,24 +74,40 @@ def safe_load_vocab(path):
     Returns:
         dict: The loaded vocabulary dictionary
     """
-    # Custom unpickler that replaces OpenNMT vocab classes with our own
-    class VocabUnpickler(torch.load):
+    # Create a custom unpickler that replaces OpenNMT vocab classes with our own
+    class CustomUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
             if module == 'onmt.inputters.inputter' and name == 'Vocab':
                 return Vocab
             if module == 'torchtext.data.field' and name == 'Field':
                 return Field
-            return super().find_class(module, name)
+            try:
+                return super().find_class(module, name)
+            except (ImportError, AttributeError):
+                # Create a dummy class for any problematic imports
+                dummy_class = type(name, (), {})
+                return dummy_class
     
     # Load the vocabulary using our custom unpickler
     try:
+        # First try to load with our custom unpickler
         with open(path, 'rb') as f:
-            vocab = torch.load(f, pickle_module=VocabUnpickler)
+            vocab = CustomUnpickler(f).load()
         return vocab
     except Exception as e:
-        print(f"Error loading vocabulary: {e}")
-        # If that fails, try the more brute-force approach
-        return torch.load(path, map_location='cpu')
+        print(f"Error with custom unpickler: {e}")
+        
+        # Fall back to torch.load with a custom function for handling missing classes
+        def _custom_load(obj_class):
+            return type(obj_class.__name__, (), {})
+        
+        try:
+            return torch.load(path, pickle_module=pickle, 
+                             pickle_load_args={"encoding": "utf-8"},
+                             map_location='cpu')
+        except Exception as e2:
+            print(f"Error with torch.load fallback: {e2}")
+            raise
 
 if __name__ == "__main__":
     # Example usage
