@@ -45,8 +45,16 @@ def main():
                                   max_len=150, k=8)
     print('Loaded Training dataset!')
 
-    # Initializing the model
-    distill_config = T5Config(vocab_size=32128, d_model=512, d_kv=64, d_ff=2048, num_layers=6, num_decoder_layers=6,
+    # Get vocabulary size from dataset to avoid dimension mismatch
+    vocab_size = len(tgt_vocab)
+    # Ensure vocabulary size is a multiple of 8 for tensor cores efficiency
+    if vocab_size % 8 != 0:
+        vocab_size += (8 - vocab_size % 8)
+    
+    print(f'Using vocabulary size: {vocab_size}')
+
+    # Initializing the model with the correct vocabulary size
+    distill_config = T5Config(vocab_size=vocab_size, d_model=512, d_kv=64, d_ff=2048, num_layers=6, num_decoder_layers=6,
                             num_heads=8,
                             dropout_rate=0.3,   # according to paper
                             layer_norm_epsilon=1e-06,
