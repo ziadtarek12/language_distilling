@@ -65,15 +65,7 @@ def _setstate(obj, state):
     obj.stoi = defaultdict(lambda: 0, obj.stoi)
 
 def safe_load_vocab(path):
-    """
-    Safely load an OpenNMT vocabulary file without triggering problematic imports.
     
-    Args:
-        path (str): Path to the vocabulary file (.pt)
-        
-    Returns:
-        dict: The loaded vocabulary dictionary
-    """
     # Create a custom unpickler that replaces OpenNMT vocab classes with our own
     class CustomUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
