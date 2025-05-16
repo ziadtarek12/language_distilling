@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 from itertools import chain, cycle
 
 import torch
-import torchtext
+#import torchtext
 from torch.nn.utils.rnn import pad_sequence
 
 # Disable torchtext deprecation warning
