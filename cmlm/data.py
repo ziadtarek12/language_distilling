@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from toolz.sandbox.core import unzip
+from toolz.itertoolz import partition_all  # Add import for partition_all
 
 
 EOS = '</s>'
@@ -357,11 +358,12 @@ class DistributedBucketSampler(BucketSampler):
 
 
 class TokenBucketSampler(Sampler):
-    def __init__(self, lens, bucket_size, batch_size, droplast=False):
+    def __init__(self, lens, bucket_size, batch_size, droplast=False, batch_multiple=1):
         self._lens = lens
         self._max_tok = batch_size
         self._bucket_size = bucket_size
         self._droplast = droplast
+        self._batch_multiple = batch_multiple
 
     def _create_ids(self):
         return list(range(len(self._lens)))
@@ -380,18 +382,37 @@ class TokenBucketSampler(Sampler):
         for bucket in buckets:
             max_len = 0
             batch_indices = []
-            for index in bucket:
-                max_len = max(max_len, self._lens[index])
-                if max_len * (len(batch_indices) + 1) > self._max_tok:
+            # Handle batch_multiple parameter for consistency with OpenNMT version
+            for indices in partition_all(self._batch_multiple, bucket):
+                indices = list(indices)  # Convert iterator to list
+                if not indices:
+                    continue
+                    
+                # Find maximum length in this batch
+                ind_max = max(self._lens[index] for index in indices)
+                if max_len * (len(batch_indices) + len(indices)) > self._max_tok:
                     if not batch_indices:
-                        raise ValueError(
-                            "max_tokens too small / max_seq_len too long")
-                    batches.append(batch_indices)
-                    batch_indices = [index]
+                        # This happens when a single sample exceeds the max_tok limit
+                        if len(indices) <= self._batch_multiple:
+                            # If it's just one batch_multiple or less, keep it anyway
+                            batches.append(indices)
+                        else:
+                            warnings.warn(
+                                "max_tokens too small / max_seq_len too long - skipping batch")
+                    else:
+                        # Add the current batch and start a new one
+                        batches.append(batch_indices)
+                        batch_indices = indices
+                        max_len = ind_max
                 else:
-                    batch_indices.append(index)
+                    # Add to the current batch
+                    batch_indices.extend(indices)
+                    max_len = max(max_len, ind_max)
+                    
+            # Add the last batch if needed
             if not self._droplast and batch_indices:
                 batches.append(batch_indices)
+                
         random.shuffle(batches)
         return iter(batches)
 
