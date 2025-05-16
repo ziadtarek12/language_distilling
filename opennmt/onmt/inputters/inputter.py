@@ -19,7 +19,9 @@ warnings.filterwarnings('ignore', message='.*torchtext.*')
 class Field:
     def __init__(self, use_vocab=True, dtype=torch.long, sequential=True, 
                  init_token=None, eos_token=None, pad_token=None, unk_token=None,
-                 postprocessing=None, include_lengths=False, batch_first=False):
+                 postprocessing=None, include_lengths=False, batch_first=False,
+                 tokenize=None, lower=False, fix_length=None, pad_first=False,
+                 truncate_first=False, stop_words=None, is_target=False):
         self.use_vocab = use_vocab
         self.dtype = dtype
         self.sequential = sequential
@@ -30,10 +32,116 @@ class Field:
         self.postprocessing = postprocessing
         self.include_lengths = include_lengths
         self.batch_first = batch_first
+        self.tokenize = tokenize
+        self.lower = lower
+        self.fix_length = fix_length
+        self.pad_first = pad_first
+        self.truncate_first = truncate_first
+        self.stop_words = stop_words
+        self.is_target = is_target
         self.vocab = None
     
     def vocab_cls(self, counter, **kwargs):
         return Vocab(counter, **kwargs)
+    
+    def build_vocab(self, *args, **kwargs):
+        """Build vocabulary from data."""
+        counter = Counter()
+        sources = []
+        for arg in args:
+            if isinstance(arg, list):
+                sources.extend(arg)
+            else:
+                sources.append(arg)
+                
+        for data in sources:
+            if isinstance(data, str):
+                tokens = self.preprocess(data)
+                counter.update(tokens)
+            else:
+                counter.update(data)
+                
+        specials = [self.unk_token, self.pad_token, self.init_token, self.eos_token]
+        specials = [token for token in specials if token is not None]
+        
+        self.vocab = self.vocab_cls(counter, specials=specials, **kwargs)
+        return self.vocab
+    
+    def preprocess(self, x):
+        """Preprocess text by tokenizing and lowercasing."""
+        if self.tokenize is not None:
+            x = self.tokenize(x)
+        elif self.sequential:
+            x = x.split()
+            
+        if self.lower:
+            x = [token.lower() for token in x]
+            
+        return x
+        
+    def process(self, batch, device=None):
+        """Process a batch of examples."""
+        padded = self.pad(batch)
+        tensor = self.numericalize(padded, device=device)
+        return tensor
+        
+    def pad(self, minibatch):
+        """Pad a batch of examples."""
+        minibatch = list(minibatch)
+        if not self.sequential:
+            return minibatch
+            
+        if self.fix_length is None:
+            max_len = max(len(x) for x in minibatch)
+        else:
+            max_len = self.fix_length
+            
+        padded = []
+        for x in minibatch:
+            if self.pad_first:
+                padded.append(
+                    [self.pad_token] * max(0, max_len - len(x)) +
+                    (x[:max_len] if len(x) > max_len else x))
+            else:
+                padded.append(
+                    (x[:max_len] if len(x) > max_len else x) +
+                    [self.pad_token] * max(0, max_len - len(x)))
+                    
+        if self.include_lengths:
+            lengths = [len(x) for x in minibatch]
+            return (padded, lengths)
+        return padded
+        
+    def numericalize(self, arr, device=None):
+        """Convert tokens to tensor of indexes."""
+        if self.include_lengths and not isinstance(arr, tuple):
+            raise ValueError("Field has include_lengths set to True, but "
+                             "input data is not a tuple of "
+                             "(data batch, batch lengths).")
+        if isinstance(arr, tuple):
+            arr, lengths = arr
+            lengths = torch.tensor(lengths, dtype=torch.long, device=device)
+
+        if self.use_vocab:
+            if self.sequential:
+                arr = [[self.vocab.stoi[x] if x in self.vocab.stoi else self.vocab.stoi[self.unk_token] 
+                       for x in ex] for ex in arr]
+            else:
+                arr = [self.vocab.stoi[x] if x in self.vocab.stoi else self.vocab.stoi[self.unk_token] for x in arr]
+
+            arr = torch.tensor(arr, dtype=self.dtype, device=device)
+        else:
+            arr = torch.tensor(arr, dtype=self.dtype, device=device)
+            
+        if self.sequential and not self.batch_first:
+            arr.t_()
+            
+        if self.sequential:
+            arr = arr.contiguous()
+            
+        if self.include_lengths:
+            return arr, lengths
+        return arr
 
 # Create Vocab class replacement
 class Vocab:

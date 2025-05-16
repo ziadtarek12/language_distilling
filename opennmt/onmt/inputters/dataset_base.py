@@ -4,9 +4,91 @@ from itertools import chain, starmap
 from collections import Counter
 
 import torch
-from torchtext.data import Dataset as TorchtextDataset
-from torchtext.data import Example
-from torchtext.vocab import Vocab
+# In newer torchtext versions, Dataset is no longer in torchtext.data
+# Implement our own Dataset class instead of importing from torchtext
+
+# Create our own Example class (similar to torchtext's)
+class Example(object):
+    """Class that represents a single training example."""
+    @classmethod
+    def fromdict(cls, data, fields):
+        ex = cls()
+        for key, vals in fields.items():
+            if key not in data:
+                raise ValueError("Specified key {} was not found in "
+                                 "the input data".format(key))
+            for name, field in vals:
+                setattr(ex, name, field.preprocess(data[key]))
+        return ex
+    
+    def __str__(self):
+        return str(self.__dict__)
+
+# Create our own Dataset class instead of importing from torchtext.data
+class TorchtextDataset(object):
+    """Class that contains and processes examples."""
+    def __init__(self, examples, fields, filter_pred=None):
+        self.examples = examples
+        self.fields = dict(fields)
+        self.filter_pred = filter_pred
+        
+        if filter_pred is not None:
+            self.examples = [ex for ex in examples if filter_pred(ex)]
+
+    def __getitem__(self, i):
+        return self.examples[i]
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __iter__(self):
+        for x in self.examples:
+            yield x
+
+    def __getattr__(self, attr):
+        if attr in self.fields:
+            for x in self.examples:
+                yield getattr(x, attr)
+        else:
+            raise AttributeError
+
+# Create our own Vocab class
+class Vocab:
+    def __init__(self, counter, specials=None, max_size=None, min_freq=1):
+        self.freqs = counter
+        self.itos = []
+        self.stoi = Counter()
+        
+        # Add special tokens
+        if specials is not None:
+            for token in specials:
+                if token is not None and token not in self.itos:
+                    self.itos.append(token)
+        
+        # Add tokens from counter
+        for token, count in sorted(counter.items(), key=lambda x: (-x[1], x[0])):
+            if token not in self.itos:
+                if max_size is not None and len(self.itos) >= max_size:
+                    break
+                if min_freq > 1 and count < min_freq:
+                    break
+                self.itos.append(token)
+        
+        # Create stoi mapping
+        for i, token in enumerate(self.itos):
+            self.stoi[token] = i
+    
+    def __getitem__(self, token):
+        return self.stoi[token]
+    
+    def __len__(self):
+        return len(self.itos)
+    
+    def extend(self, v):
+        self.itos.extend(v.itos)
+        for token in v.itos:
+            if token not in self.stoi:
+                self.stoi[token] = len(self.stoi)
 
 
 def _join_dicts(*args):
@@ -17,30 +99,10 @@ def _join_dicts(*args):
     Returns:
         a single dictionary that has the union of these keys.
     """
-
     return dict(chain(*[d.items() for d in args]))
 
 
 def _dynamic_dict(example, src_field, tgt_field):
-    """Create copy-vocab and numericalize with it.
-
-    In-place adds ``"src_map"`` to ``example``. That is the copy-vocab
-    numericalization of the tokenized ``example["src"]``. If ``example``
-    has a ``"tgt"`` key, adds ``"alignment"`` to example. That is the
-    copy-vocab numericalization of the tokenized ``example["tgt"]``. The
-    alignment has an initial and final UNK token to match the BOS and EOS
-    tokens.
-
-    Args:
-        example (dict): An example dictionary with a ``"src"`` key and
-            maybe a ``"tgt"`` key. (This argument changes in place!)
-        src_field (torchtext.data.Field): Field object.
-        tgt_field (torchtext.data.Field): Field object.
-
-    Returns:
-        torchtext.data.Vocab and ``example``, changed as described.
-    """
-
     src = src_field.tokenize(example["src"])
     # make a small vocab containing just the tokens in the source sequence
     unk = src_field.unk_token
