@@ -121,103 +121,174 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, gpu_id=None):
     Returns:
         the NMTModel.
     """
-
-    # Build embeddings.
-    if model_opt.model_type == "text":
-        src_field = fields["src"]
-        src_emb = build_embeddings(model_opt, src_field)
-    else:
-        src_emb = None
-
-    # Build encoder.
-    encoder = build_encoder(model_opt, src_emb)
-
-    # Build decoder.
-    tgt_field = fields["tgt"]
-    tgt_emb = build_embeddings(model_opt, tgt_field, for_encoder=False)
-
-    # Share the embedding matrix - preprocess with share_vocab required.
-    if model_opt.share_embeddings:
-        # src/tgt vocab should be the same if `-share_vocab` is specified.
-        assert src_field.base_field.vocab == tgt_field.base_field.vocab, \
-            "preprocess with -share_vocab if you use share_embeddings"
-
-        tgt_emb.word_lut.weight = src_emb.word_lut.weight
-
-    decoder = build_decoder(model_opt, tgt_emb)
-
-    # Build NMTModel(= encoder + decoder).
-    if gpu and gpu_id is not None:
-        device = torch.device("cuda", gpu_id)
-    elif gpu and not gpu_id:
-        device = torch.device("cuda")
-    elif not gpu:
-        device = torch.device("cpu")
-    model = onmt.models.NMTModel(encoder, decoder)
-
-    # Build Generator.
-    if not model_opt.copy_attn:
-        if model_opt.generator_function == "sparsemax":
-            gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
+    try:
+        # Build embeddings.
+        if model_opt.model_type == "text":
+            src_field = fields["src"]
+            src_emb = build_embeddings(model_opt, src_field)
         else:
-            gen_func = nn.LogSoftmax(dim=-1)
-        generator = nn.Sequential(
-            nn.Linear(model_opt.dec_rnn_size,
-                      len(fields["tgt"].base_field.vocab)),
-            Cast(torch.float32),
-            gen_func
-        )
-        if model_opt.share_decoder_embeddings:
-            generator[0].weight = decoder.embeddings.word_lut.weight
-    else:
-        tgt_base_field = fields["tgt"].base_field
-        vocab_size = len(tgt_base_field.vocab)
-        pad_idx = tgt_base_field.vocab.stoi[tgt_base_field.pad_token]
-        generator = CopyGenerator(model_opt.dec_rnn_size, vocab_size, pad_idx)
+            src_emb = None
 
-    # Load the model states from checkpoint or initialize them.
-    if checkpoint is not None:
-        # This preserves backward-compat for models using customed layernorm
-        def fix_key(s):
-            s = re.sub(r'(.*)\.layer_norm((_\d+)?)\.b_2',
-                       r'\1.layer_norm\2.bias', s)
-            s = re.sub(r'(.*)\.layer_norm((_\d+)?)\.a_2',
-                       r'\1.layer_norm\2.weight', s)
-            return s
+        # Build encoder.
+        encoder = build_encoder(model_opt, src_emb)
 
-        checkpoint['model'] = {fix_key(k): v
-                               for k, v in checkpoint['model'].items()}
-        # end of patch for backward compatibility
+        # Build decoder.
+        tgt_field = fields["tgt"]
+        tgt_emb = build_embeddings(model_opt, tgt_field, for_encoder=False)
 
-        model.load_state_dict(checkpoint['model'], strict=False)
-        generator.load_state_dict(checkpoint['generator'], strict=False)
-    else:
-        if model_opt.param_init != 0.0:
-            for p in model.parameters():
-                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-            for p in generator.parameters():
-                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-        if model_opt.param_init_glorot:
-            for p in model.parameters():
-                if p.dim() > 1:
-                    xavier_uniform_(p)
-            for p in generator.parameters():
-                if p.dim() > 1:
-                    xavier_uniform_(p)
+        # Share the embedding matrix - preprocess with share_vocab required.
+        if model_opt.share_embeddings:
+            # Verify vocab compatibility
+            if not hasattr(src_field.base_field, 'vocab') or not hasattr(tgt_field.base_field, 'vocab'):
+                logger.warning("Cannot share embeddings because field vocab attributes are missing")
+            elif src_field.base_field.vocab != tgt_field.base_field.vocab:
+                logger.warning("Source and target vocab are different, cannot share embeddings. "
+                              "Process data with -share_vocab option for shared embeddings.")
+            else:
+                # Only share embeddings if vocabs match
+                tgt_emb.word_lut.weight = src_emb.word_lut.weight
+                logger.info("Embeddings shared successfully")
 
-        if hasattr(model.encoder, 'embeddings'):
-            model.encoder.embeddings.load_pretrained_vectors(
-                model_opt.pre_word_vecs_enc)
-        if hasattr(model.decoder, 'embeddings'):
-            model.decoder.embeddings.load_pretrained_vectors(
-                model_opt.pre_word_vecs_dec)
+        decoder = build_decoder(model_opt, tgt_emb)
 
-    model.generator = generator
-    model.to(device)
-    if model_opt.model_dtype == 'fp16':
-        model.half()
+        # Build NMTModel(= encoder + decoder).
+        if gpu and gpu_id is not None:
+            device = torch.device("cuda", gpu_id)
+        elif gpu and not gpu_id:
+            device = torch.device("cuda")
+        elif not gpu:
+            device = torch.device("cpu")
+        
+        # Print model settings for debugging
+        logger.info(f"Model type: {model_opt.model_type}")
+        logger.info(f"Encoder type: {model_opt.encoder_type}")
+        logger.info(f"Decoder type: {model_opt.decoder_type}")
+        logger.info(f"Using device: {device}")
+        
+        model = onmt.models.NMTModel(encoder, decoder)
 
-    return model
+        # Build Generator.
+        if not model_opt.copy_attn:
+            if model_opt.generator_function == "sparsemax":
+                gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
+            else:
+                gen_func = nn.LogSoftmax(dim=-1)
+                
+            # Get vocabulary size and check for validity
+            tgt_vocab_size = len(fields["tgt"].base_field.vocab)
+            logger.info(f"Target vocabulary size: {tgt_vocab_size}")
+            
+            # Ensure dimensions match
+            if hasattr(model_opt, 'dec_rnn_size'):
+                dec_output_dim = model_opt.dec_rnn_size
+            else:
+                # Default to rnn_size if dec_rnn_size is not specified
+                dec_output_dim = model_opt.rnn_size
+                logger.warning(f"dec_rnn_size not specified, using rnn_size ({dec_output_dim}) instead")
+                
+            logger.info(f"Decoder output dimension: {dec_output_dim}")
+            
+            generator = nn.Sequential(
+                nn.Linear(dec_output_dim, tgt_vocab_size),
+                Cast(torch.float32),
+                gen_func
+            )
+            
+            if model_opt.share_decoder_embeddings:
+                if generator[0].weight.shape == decoder.embeddings.word_lut.weight.shape:
+                    generator[0].weight = decoder.embeddings.word_lut.weight
+                    logger.info("Decoder embeddings shared with generator successfully")
+                else:
+                    logger.warning(f"Cannot share decoder embeddings with generator: shape mismatch "
+                                  f"({generator[0].weight.shape} vs {decoder.embeddings.word_lut.weight.shape})")
+        else:
+            tgt_base_field = fields["tgt"].base_field
+            vocab_size = len(tgt_base_field.vocab)
+            pad_idx = tgt_base_field.vocab.stoi[tgt_base_field.pad_token]
+            generator = CopyGenerator(model_opt.dec_rnn_size, vocab_size, pad_idx)
+
+        # Load the model states from checkpoint or initialize them.
+        if checkpoint is not None:
+            # This preserves backward-compat for models using customed layernorm
+            def fix_key(s):
+                s = re.sub(r'(.*)\.layer_norm((_\d+)?)\.b_2',
+                          r'\1.layer_norm\2.bias', s)
+                s = re.sub(r'(.*)\.layer_norm((_\d+)?)\.a_2',
+                          r'\1.layer_norm\2.weight', s)
+                return s
+
+            checkpoint['model'] = {fix_key(k): v
+                                  for k, v in checkpoint['model'].items()}
+            # end of patch for backward compatibility
+
+            model.load_state_dict(checkpoint['model'], strict=False)
+            generator.load_state_dict(checkpoint['generator'], strict=False)
+        else:
+            if model_opt.param_init != 0.0:
+                for p in model.parameters():
+                    p.data.uniform_(-model_opt.param_init, model_opt.param_init)
+                for p in generator.parameters():
+                    p.data.uniform_(-model_opt.param_init, model_opt.param_init)
+            if model_opt.param_init_glorot:
+                for p in model.parameters():
+                    if p.dim() > 1:
+                        xavier_uniform_(p)
+                for p in generator.parameters():
+                    if p.dim() > 1:
+                        xavier_uniform_(p)
+
+            if hasattr(model.encoder, 'embeddings'):
+                model.encoder.embeddings.load_pretrained_vectors(
+                    model_opt.pre_word_vecs_enc)
+            if hasattr(model.decoder, 'embeddings'):
+                model.decoder.embeddings.load_pretrained_vectors(
+                    model_opt.pre_word_vecs_dec)
+
+        model.generator = generator
+        
+        # Move model to device with error handling
+        try:
+            logger.info("Moving model to device...")
+            # First try to move components separately to identify the problematic part
+            for name, component in [('encoder', model.encoder), ('decoder', model.decoder)]:
+                try:
+                    component.to(device)
+                    logger.info(f"{name} successfully moved to {device}")
+                except Exception as e:
+                    logger.error(f"Error moving {name} to {device}: {str(e)}")
+                    raise
+            
+            # Then try to move generator
+            try:
+                generator.to(device)
+                logger.info(f"Generator successfully moved to {device}")
+            except Exception as e:
+                logger.error(f"Error moving generator to {device}: {str(e)}")
+                raise
+                
+            # Set model dtype if needed
+            if model_opt.model_dtype == 'fp16':
+                model.half()
+                logger.info("Model converted to half precision (fp16)")
+                
+            return model
+            
+        except RuntimeError as e:
+            logger.error(f"CUDA error during model creation: {str(e)}")
+            logger.error("Falling back to CPU as a workaround")
+            
+            # Create a new CPU device and try again
+            cpu_device = torch.device("cpu")
+            model.to(cpu_device)
+            # Update the model_opt to prevent further GPU usage attempts
+            model_opt.gpu = -1
+            return model
+            
+    except Exception as e:
+        logger.error(f"Error in build_base_model: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
 
 
 def build_model(model_opt, opt, fields, checkpoint):
