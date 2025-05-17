@@ -193,6 +193,11 @@ def kd_loss(log_prob, teacher_outputs, temperature, mask, top_k):
     #       better empirical performance this way
     T = temperature
     topk_prob, topk_idx = teacher_outputs
+    
+    # Clip the indices to be within the valid range to prevent CUDA errors
+    vocab_size = log_prob.size(-1)
+    topk_idx = torch.clamp(topk_idx, 0, vocab_size - 1)
+    
     topk_prob = F.softmax(topk_prob/T, dim=-1)
     loss = -(log_prob.gather(dim=-1, index=topk_idx) * topk_prob)[mask].sum()
     return loss
