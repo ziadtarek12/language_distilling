@@ -222,7 +222,12 @@ class Trainer(object):
             train_iter = itertools.islice(
                 train_iter, self.gpu_rank, None, self.n_gpu)
 
-        step = 0
+        # Initialize step - use optimizer's step counter or 0 if not available
+        try:
+            step = self.optim.training_step
+        except (AttributeError, TypeError):
+            step = 0
+            
         for i, (batches, normalization) in enumerate(
                 self._accum_batches(train_iter)):
             step = self.optim.training_step
@@ -282,6 +287,7 @@ class Trainer(object):
                 break
 
         if self.model_saver is not None:
+            logger.info('Saving final model checkpoint')
             self.model_saver.save(step, moving_average=self.moving_average)
         return total_stats
 
