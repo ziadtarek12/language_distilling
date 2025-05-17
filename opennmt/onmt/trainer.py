@@ -223,7 +223,10 @@ class Trainer(object):
                 train_iter, self.gpu_rank, None, self.n_gpu)
 
         # Initialize step - use optimizer's step counter or 0 if not available
-        step = 0
+        try:
+            step = self.optim.training_step
+        except (AttributeError, TypeError):
+            step = 0
             
         for i, (batches, normalization) in enumerate(
                 self._accum_batches(train_iter)):
