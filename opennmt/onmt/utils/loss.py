@@ -319,8 +319,9 @@ class BertKDLossCompute(LossComputeBase):
     """
     Standard NMT Loss Computation with BERT Knowledge Distillation
     """
-    def __init__(self, generator, padding_idx, lsr=0.1, top_k=8):
-        super().__init__(kd_loss, generator)
+    def __init__(self, model, padding_idx, lsr=0.1, top_k=8):
+        super().__init__(kd_loss, model.generator)
+        self.model = model
         self.pad = padding_idx
         self.lsr = lsr
         self.top_k = top_k
@@ -330,7 +331,7 @@ class BertKDLossCompute(LossComputeBase):
         return self.pad
 
     def __call__(self, outputs, bert_logits, target, normalization,
-                 temperature, alpha):
+                 temperature=10.0, alpha=0.5):
         scores = self._bottle(self.generator(outputs))
         target = target.view(-1)
         non_pad = target != self.padding_idx

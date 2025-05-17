@@ -333,66 +333,48 @@ class Trainer(object):
             self.optim.zero_grad()
 
         for batch in true_batches:
-            target_size = batch.tgt.size(0)
-            if self.model_dtype == 'fp16' and 'src_map' in batch.__dict__:
-                batch.src_map = batch.src_map.half()
-            # Truncated BPTT: reminder not compatible with accum > 1
             if self.trunc_size:
-                trunc_size = self.trunc_size
-            else:
-                trunc_size = target_size
+                raise ValueError('truncated BPTT not supported')
 
             src, src_lengths = batch.src if isinstance(batch.src, tuple) \
                 else (batch.src, None)
             if src_lengths is not None:
                 report_stats.n_src_words += src_lengths.sum().item()
 
-            tgt_outer = batch.tgt
+            # BERT knowledge distillation
+            tgt = batch.tgt
 
-            bptt = False
-            for j in range(0, target_size-1, trunc_size):
-                # 1. Create truncated target.
-                tgt = tgt_outer[j: j + trunc_size]
+            # 1. F-prop all but generator.
+            if self.grad_accum_count == 1:
+                self.optim.zero_grad()
+                
+            outputs, attns = self.model(src, tgt, src_lengths, bptt=False)
+            
+            # mask select
+            tgt_out = tgt[1:, :, 0]
 
-                # 2. F-prop all but generator.
-                if self.grad_accum_count == 1:
-                    self.optim.zero_grad()
-                outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt)
-                bptt = True
+            # 2. Compute loss.
+            loss, batch_stats = self.train_loss(
+                outputs, batch.bert_topk, tgt_out,
+                normalization,
+                self.temperature, self.alpha)
 
-                # 3. Compute loss.
-                loss, batch_stats = self.train_loss(
-                    batch,
-                    outputs,
-                    attns,
-                    normalization=normalization,
-                    shard_size=self.shard_size,
-                    trunc_start=j,
-                    trunc_size=trunc_size)
+            if loss is not None:
+                self.optim.backward(loss)
 
-                if loss is not None:
-                    self.optim.backward(loss)
+            total_stats.update(batch_stats)
+            report_stats.update(batch_stats)
 
-                total_stats.update(batch_stats)
-                report_stats.update(batch_stats)
-
-                # 4. Update the parameters and statistics.
-                if self.grad_accum_count == 1:
-                    # Multi GPU gradient gather
-                    if self.n_gpu > 1:
-                        grads = [p.grad.data for p in self.model.parameters()
-                                 if p.requires_grad
-                                 and p.grad is not None]
-                        onmt.utils.distributed.all_reduce_and_rescale_tensors(
-                            grads, float(1))
-                    self.optim.step()
-
-                # If truncated, don't backprop fully.
-                # TO CHECK
-                # if dec_state is not None:
-                #    dec_state.detach()
-                if self.model.decoder.state is not None:
-                    self.model.decoder.detach_state()
+            # 3. Update the parameters and statistics.
+            if self.grad_accum_count == 1:
+                # Multi GPU gradient gather
+                if self.n_gpu > 1:
+                    grads = [p.grad.data for p in self.model.parameters()
+                             if p.requires_grad
+                             and p.grad is not None]
+                    onmt.utils.distributed.all_reduce_and_rescale_tensors(
+                        grads, float(1))
+                self.optim.step()
 
         # in case of multi step gradient accumulation,
         # update only after accum batches
@@ -404,6 +386,7 @@ class Trainer(object):
                 onmt.utils.distributed.all_reduce_and_rescale_tensors(
                     grads, float(1))
             self.optim.step()
+
 
     def _start_report_manager(self, start_time=None):
         """
@@ -526,17 +509,18 @@ class BertKDTrainer(Trainer):
                 report_stats.n_src_words += src_lengths.sum().item()
 
             # BERT knowledge distillation
+            tgt = batch.tgt
 
             # 1. F-prop all but generator.
             if self.grad_accum_count == 1:
                 self.optim.zero_grad()
-            outputs, attns = self.model(src, batch.tgt, src_lengths,
-                                        bptt=False)
+                
+            outputs, attns = self.model(src, tgt, src_lengths, bptt=False)
+            
             # mask select
-            tgt_out = batch.tgt[1:, :, 0]
+            tgt_out = tgt[1:, :, 0]
 
             # 2. Compute loss.
-            # NOTE we do not follow OpenNMT loss computation
             loss, batch_stats = self.train_loss(
                 outputs, batch.bert_topk, tgt_out,
                 normalization,
