@@ -115,9 +115,25 @@ class BertKdDataset(Dataset):
             raise ValueError(f"Error opening topk database: {e}. Make sure you've completed Stage 2 (extracting knowledge) "
                              f"before running Stage 3. The topk database should exist at {bert_dump_path}/topk")
         
+        # Ensure the keys in both databases match
         self.ids = []
         self.keys = []
-        for i, ex in self.db.items():
+        # Only include examples that are in BOTH the corpus and topk databases
+        db_keys = set(self.db.keys())
+        topk_keys = set(self.topk_db.keys())
+        common_keys = db_keys.intersection(topk_keys)
+        
+        print(f"Found {len(db_keys)} keys in corpus database")
+        print(f"Found {len(topk_keys)} keys in topk database")
+        print(f"Found {len(common_keys)} common keys between databases")
+        
+        if len(common_keys) == 0:
+            raise ValueError("No common keys found between corpus and topk databases! "
+                             "This suggests the topk database was not created properly. "
+                             "Please regenerate the topk database using dump_teacher_topk.py")
+        
+        for i in common_keys:
+            ex = self.db[i]
             src_len = len(ex['src'])
             tgt_len = len(ex['tgt'])
             if (src_len <= max_len
@@ -125,6 +141,9 @@ class BertKdDataset(Dataset):
                     and src_len + tgt_len + 3 <= 512):
                 self.ids.append(i)
                 self.keys.append((src_len, tgt_len))
+        
+        print(f"Using {len(self.ids)} examples after filtering by length constraints")
+        
         # vocab for seq2seq
         self.src_vocab = src_vocab
         self.tgt_vocab = tgt_vocab
