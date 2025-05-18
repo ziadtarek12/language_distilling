@@ -9,7 +9,7 @@ from itertools import chain, cycle
 
 import torch
 import torchtext
-from torchtext.legacy.data import Batch
+from torchtext.data import Batch
 from torch.nn.utils.rnn import pad_sequence
 
 # Disable torchtext deprecation warning
