@@ -103,8 +103,18 @@ def load_topk(dump):
 class BertKdDataset(Dataset):
     def __init__(self, corpus_path, bert_dump_path,
                  src_vocab, tgt_vocab, max_len=150, k=8):
-        self.db = shelve.open(corpus_path, 'r')
-        self.topk_db = shelve.open(f'{bert_dump_path}/topk', 'r')
+        try:
+            self.db = shelve.open(corpus_path, 'r')
+        except Exception as e:
+            raise ValueError(f"Error opening corpus database: {e}. Make sure the file exists at {corpus_path}")
+        
+        # Try to open the topk database in read mode, and if it fails, provide a helpful error message
+        try:
+            self.topk_db = shelve.open(f'{bert_dump_path}/topk', 'r')
+        except Exception as e:
+            raise ValueError(f"Error opening topk database: {e}. Make sure you've completed Stage 2 (extracting knowledge) "
+                             f"before running Stage 3. The topk database should exist at {bert_dump_path}/topk")
+        
         self.ids = []
         self.keys = []
         for i, ex in self.db.items():
