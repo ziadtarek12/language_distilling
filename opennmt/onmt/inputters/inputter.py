@@ -9,6 +9,7 @@ from itertools import chain, cycle
 
 import torch
 import torchtext
+from torchtext.legacy.data import Batch
 from torch.nn.utils.rnn import pad_sequence
 
 # Disable torchtext deprecation warning
@@ -668,6 +669,7 @@ class OrderedIterator(object):
                  sort_key=None,
                  random_shuffler=None):
         self.dataset = dataset
+        self.fields = dataset.fields
         self.batch_size = batch_size
         self.batch_size_multiple = batch_size_multiple
         self.device = device
@@ -676,65 +678,61 @@ class OrderedIterator(object):
         self.sort = sort
         self.sort_within_batch = sort_within_batch
         self.sort_key = sort_key
-        self.random_shuffler = random_shuffler
         if random_shuffler is None:
-            self.random_shuffler = lambda x: random.shuffle(x)
+            self.random_shuffler = random.Random().shuffle
+        else:
+            self.random_shuffler = random_shuffler
         self.batches = None
-        self.create_batches()
+        self._iter = None
 
     def data(self):
-        if self.repeat:
-            def _data():
-                dataset_iter = iter(self.dataset)
-                while True:
-                    try:
-                        item = next(dataset_iter)
-                        yield item
-                    except StopIteration:
-                        dataset_iter = iter(self.dataset)
-                        item = next(dataset_iter)
-                        yield item
-            return _data()
+        if self.train:
+            if self.sort_key is None:
+                return self.dataset
+            else:
+                return sorted(self.dataset, key=self.sort_key)
         else:
-            return iter(self.dataset)
+            if self.sort_key is None:
+                return self.dataset
+            else:
+                return sorted(self.dataset, key=self.sort_key)
 
     def create_batches(self):
-        if self.train:
-            def _pool(data, random_shuffler):
-                for p in batch(data, self.batch_size * 100):
-                    p_batch = batch_iter(
-                        sorted(p, key=self.sort_key),
-                        self.batch_size,
-                        batch_size_fn=self.batch_size_fn if hasattr(self, 'batch_size_fn') else None,
-                        batch_size_multiple=self.batch_size_multiple)
-                    for b in random_shuffler(list(p_batch)):
-                        yield b
+        if self.batches is not None:
+            return
+        self.batches = []
+        data_source = self.data()
+        for b_list in batch_iter(
+                data_source,
+                self.batch_size,
+                batch_size_fn=self.batch_size_fn if hasattr(self, 'batch_size_fn') else None,
+                batch_size_multiple=self.batch_size_multiple):
 
-            self.batches = _pool(self.data(), self.random_shuffler)
-        else:
-            self.batches = []
-            for b in batch_iter(
-                    self.data(),
-                    self.batch_size,
-                    batch_size_fn=self.batch_size_fn if hasattr(self, 'batch_size_fn') else None,
-                    batch_size_multiple=self.batch_size_multiple):
-                self.batches.append(sorted(b, key=self.sort_key) if self.sort_key else b)
+            if b_list:
+                if self.sort_within_batch and self.sort_key is not None:
+                    b_list = sorted(b_list, key=self.sort_key)
+                self.batches.append(Batch(b_list, self.dataset, self.device))
 
-    def __iter__(self):
-        if self.batches is None:
-            self.create_batches()
-        if self.sort:
-            if self.sort_within_batch:
-                return (sorted(b, key=self.sort_key) for b in self.batches)
-            else:
-                return (b for b in self.batches)
-        else:
-            return (b for b in self.batches)
+    @property
+    def epoch(self):
+        return self._iter
 
     def __len__(self):
-        if self.batches is None:
-            self.create_batches()
+        self.create_batches()
         return len(self.batches)
+
+    def __iter__(self):
+        self.create_batches()
+        if self.train and self.repeat:
+            if self.random_shuffler is not None:
+                self.random_shuffler(self.batches)
+            self._iter = cycle(self.batches)
+        else:
+            if self.train and self.random_shuffler is not None:
+                 self.random_shuffler(self.batches)
+            self._iter = iter(self.batches)
+        return self._iter
+
 
 def batch(data, batch_size):
     """Yield elements from data in chunks of batch_size."""
