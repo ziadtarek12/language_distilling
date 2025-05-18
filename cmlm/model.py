@@ -19,17 +19,16 @@ def convert_embedding(toker, vocab, emb_weight):
     # Check if the embedding weight is 1D or 2D
     if len(emb_weight.shape) == 2:
         # Standard case: [vocab_size, embedding_dim]
-        vocab_size = emb_weight.size(0)  # Changed from size(1) to size(0)
-        embedding_dim = emb_weight.size(1)
+        vocab_size = emb_weight.size(0)  # Get vocabulary size
+        embedding_dim = emb_weight.size(1)  # Get embedding dimension
     else:
         # Handle unexpected shape
         raise ValueError(f"Unexpected embedding weight shape: {emb_weight.shape}")
     
-    if vocab_size % 8 != 0:
-        # pad for tensor cores
-        vocab_size += (8 - vocab_size % 8)
-        
-    vectors = [torch.zeros(embedding_dim) for _ in range(len(vocab))]  # Create vectors with embedding_dim
+    # Generate embeddings for the target vocabulary
+    vectors = [torch.zeros(embedding_dim) for _ in range(len(vocab))]
+    
+    # Map tokens from the target vocabulary to BERT vocabulary
     for word, id_ in vocab.items():
         word = word.replace(IN_WORD, '')
         if word in toker.vocab:
@@ -37,7 +36,13 @@ def convert_embedding(toker, vocab, emb_weight):
         else:
             bert_id = toker.vocab['[UNK]']
         vectors[id_] = emb_weight[bert_id].clone()
+    
+    # Stack the vectors to create the embedding parameter
     embedding = nn.Parameter(torch.stack(vectors, dim=0))
+    
+    # Verify dimensions
+    assert embedding.size(1) == embedding_dim, f"Embedding dimensions don't match: {embedding.size(1)} vs {embedding_dim}"
+    
     return embedding
 
 
@@ -68,10 +73,26 @@ class BertForSeq2seq(BertForMaskedLM):
         return self._init_weights(module)
 
     def update_output_layer(self, output_embedding):
-        self.cls.predictions.decoder.weight = output_embedding
+        # Check and ensure dimensions match
+        hidden_size = self.config.hidden_size
+        if output_embedding.size(1) != hidden_size:
+            raise ValueError(f"Output embedding dimension {output_embedding.size(1)} doesn't match hidden size {hidden_size}")
+        
+        # Create a new decoder with correct dimensions instead of directly using output_embedding
         vocab_size = output_embedding.size(0)
+        self.cls.predictions.decoder = nn.Linear(hidden_size, vocab_size, bias=True)
+        
+        # Copy the weights properly
+        self.cls.predictions.decoder.weight.data.copy_(output_embedding.data)
+        
+        # Initialize bias
         self.cls.predictions.bias = nn.Parameter(torch.zeros(vocab_size))
+        
+        # Update config to match
         self.config.vocab_size = vocab_size
+        
+        # Return the decoder to enable verification
+        return self.cls.predictions.decoder
 
     def update_output_layer_by_size(self, vocab_size):
         if vocab_size % 8 != 0:
@@ -164,9 +185,19 @@ class BertForSeq2seq(BertForMaskedLM):
         sequence_output_masked = sequence_output.masked_select(
             output_mask.unsqueeze(-1).expand_as(sequence_output)
         ).contiguous().view(-1, self.config.hidden_size)
+        
+        # Check if we have any predictions to make
         n_pred, hid = sequence_output_masked.size()
-        if do_padding and (n_pred == 0 or n_pred % 8):
-            # pad for tensor cores
+        if n_pred == 0:
+            # No tokens to predict, return zero loss or empty prediction
+            if masked_lm_labels is not None:
+                return torch.tensor(0.0, device=input_ids.device)
+            else:
+                # Return empty prediction tensor with correct shape
+                return torch.zeros((0, self.config.vocab_size), device=input_ids.device)
+        
+        # Pad if necessary for tensor cores
+        if do_padding and n_pred % 8:
             n_pad = 8 - n_pred % 8
             pad = torch.zeros(n_pad, hid,
                               dtype=sequence_output_masked.dtype,
@@ -175,7 +206,26 @@ class BertForSeq2seq(BertForMaskedLM):
                 [sequence_output_masked, pad], dim=0)
         else:
             n_pad = 0
-        prediction_scores = self.cls.predictions(sequence_output_masked)
+        
+        # Verify dimensions before forwarding to predictions
+        if hasattr(self.cls.predictions, 'transform'):
+            hidden_size = self.cls.predictions.transform.dense.weight.size(1)
+            if hidden_size != hid:
+                raise ValueError(f"Hidden size mismatch: got {hid}, expected {hidden_size}")
+        
+        # Check if decoder dimensions match
+        decoder_input_size = self.cls.predictions.decoder.weight.size(1)
+        if decoder_input_size != self.config.hidden_size:
+            raise ValueError(f"Decoder input size {decoder_input_size} doesn't match hidden size {self.config.hidden_size}")
+        
+        # Forward through prediction layer
+        try:
+            prediction_scores = self.cls.predictions(sequence_output_masked)
+        except RuntimeError as e:
+            # Provide detailed error info
+            decoder_shape = self.cls.predictions.decoder.weight.shape
+            input_shape = sequence_output_masked.shape
+            raise RuntimeError(f"Dimension mismatch in decoder. Decoder: {decoder_shape}, Input: {input_shape}. Original error: {str(e)}")
 
         if masked_lm_labels is not None:
             loss_fct = nn.CrossEntropyLoss(ignore_index=-1)
