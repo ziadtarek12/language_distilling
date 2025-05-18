@@ -15,27 +15,58 @@ IN_WORD = '@@'
 
 
 def convert_embedding(toker, vocab, emb_weight):
-    """ seq2seq vs pretrained BERT embedding conversion"""
+    """ 
+    Converts BERT embeddings to embeddings for a custom vocabulary.
+    
+    This function maps tokens from the target vocabulary to their corresponding
+    embeddings in the BERT model vocabulary, creating a new embedding matrix
+    suitable for the target task's vocabulary.
+    
+    Args:
+        toker (BertTokenizer): The BERT tokenizer containing the source vocabulary
+        vocab (dict): The target vocabulary mapping (word -> id)
+        emb_weight (torch.Tensor): The embeddings from BERT model
+        
+    Returns:
+        nn.Parameter: Parameter containing embeddings for the target vocabulary
+    """
     # Check if the embedding weight is 1D or 2D
     if len(emb_weight.shape) == 2:
         # Standard case: [vocab_size, embedding_dim]
-        vocab_size = emb_weight.size(0)  # Get vocabulary size
-        embedding_dim = emb_weight.size(1)  # Get embedding dimension
+        bert_vocab_size = emb_weight.size(0)
+        embedding_dim = emb_weight.size(1)
     else:
         # Handle unexpected shape
         raise ValueError(f"Unexpected embedding weight shape: {emb_weight.shape}")
     
+    # Print dimensions for debugging
+    print(f"BERT vocabulary size: {bert_vocab_size}, Embedding dimension: {embedding_dim}")
+    print(f"Target vocabulary size: {len(vocab)}")
+    
     # Generate embeddings for the target vocabulary
     vectors = [torch.zeros(embedding_dim) for _ in range(len(vocab))]
     
+    # Track OOV (out of vocabulary) tokens
+    oov_count = 0
+    
     # Map tokens from the target vocabulary to BERT vocabulary
     for word, id_ in vocab.items():
+        # Remove special token markers if present
         word = word.replace(IN_WORD, '')
+        
+        # Look up word in BERT vocabulary
         if word in toker.vocab:
             bert_id = toker.vocab[word]
         else:
-            bert_id = toker.vocab['[UNK]']
+            bert_id = toker.vocab['[UNK]']  # Use UNK token embedding for OOV
+            oov_count += 1
+            
+        # Copy embedding from BERT
         vectors[id_] = emb_weight[bert_id].clone()
+    
+    # Report OOV statistics
+    if oov_count > 0:
+        print(f"OOV tokens: {oov_count}/{len(vocab)} ({oov_count/len(vocab):.2%})")
     
     # Stack the vectors to create the embedding parameter
     embedding = nn.Parameter(torch.stack(vectors, dim=0))
@@ -73,13 +104,28 @@ class BertForSeq2seq(BertForMaskedLM):
         return self._init_weights(module)
 
     def update_output_layer(self, output_embedding):
-        # Check and ensure dimensions match
+        """Update the output layer with the given embeddings.
+        
+        This method ensures proper dimension handling between the BERT hidden size
+        and the target vocabulary size. It creates a new decoder with compatible dimensions
+        and initializes it with the provided embeddings.
+        
+        Args:
+            output_embedding (nn.Parameter): Embedding weights for the target vocabulary
+            
+        Returns:
+            nn.Linear: The newly created decoder layer
+        """
+        # Check and ensure dimensions match hidden size
         hidden_size = self.config.hidden_size
         if output_embedding.size(1) != hidden_size:
             raise ValueError(f"Output embedding dimension {output_embedding.size(1)} doesn't match hidden size {hidden_size}")
         
-        # Create a new decoder with correct dimensions instead of directly using output_embedding
+        # Create a new decoder with correct dimensions
         vocab_size = output_embedding.size(0)
+        print(f"Creating decoder with dimensions: input={hidden_size}, output={vocab_size}")
+        
+        # Create new decoder layer
         self.cls.predictions.decoder = nn.Linear(hidden_size, vocab_size, bias=True)
         
         # Copy the weights properly
@@ -88,7 +134,7 @@ class BertForSeq2seq(BertForMaskedLM):
         # Initialize bias
         self.cls.predictions.bias = nn.Parameter(torch.zeros(vocab_size))
         
-        # Update config to match
+        # Update config to match new vocabulary size
         self.config.vocab_size = vocab_size
         
         # Return the decoder to enable verification
