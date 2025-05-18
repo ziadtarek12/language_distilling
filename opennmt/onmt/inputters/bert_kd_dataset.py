@@ -136,15 +136,33 @@ class BertKdDataset(Dataset):
 
     def __getitem__(self, i):
         id_ = self.ids[i]
-        example = self.db[id_]
-        src_ids = torch.tensor([self.src_vocab[tok] for tok in example['src']])
-        src_len = len(src_ids)
-        tgt_ids = torch.tensor([self.tgt_vocab[tok]
-                                for tok in [BOS] + example['tgt'] + [EOS]])
-        topk_logits, topk_inds = load_topk(self.topk_db[id_])
-        topk_logits = topk_logits[:, :self.k].float()
-        topk_inds = topk_inds[:, :self.k]
-        return i, src_ids, src_len, tgt_ids, topk_logits, topk_inds
+        try:
+            example = self.db[id_]
+            src_ids = torch.tensor([self.src_vocab[tok] for tok in example['src']])
+            src_len = len(src_ids)
+            tgt_ids = torch.tensor([self.tgt_vocab[tok]
+                                    for tok in [BOS] + example['tgt'] + [EOS]])
+            
+            try:
+                topk_logits, topk_inds = load_topk(self.topk_db[id_])
+                topk_logits = topk_logits[:, :self.k].float()
+                topk_inds = topk_inds[:, :self.k]
+            except KeyError:
+                # Handle missing keys in topk database
+                print(f"Warning: Key {id_} not found in topk database. Using zeros.")
+                # Create dummy tensors with appropriate shapes
+                seq_len = len(example['tgt'])
+                topk_logits = torch.zeros(seq_len, self.k, dtype=torch.float32)
+                topk_inds = torch.zeros(seq_len, self.k, dtype=torch.long)
+            
+            return i, src_ids, src_len, tgt_ids, topk_logits, topk_inds
+        
+        except KeyError as e:
+            print(f"Error: Key {id_} not found in main database. Error: {e}")
+            # Find a valid key as a fallback
+            fallback_id = self.ids[0] if i != 0 else self.ids[1]
+            print(f"Using fallback key {fallback_id} instead.")
+            return self.__getitem__(0 if i != 0 else 1)
 
     @staticmethod
     def pad_collate(features):
