@@ -3,6 +3,7 @@ from functools import partial
 
 import six
 import torch
+from torchtext.legacy.data import RawField as TorchtextRawField
 
 # Create RawField class instead of importing from torchtext.data
 class RawField:
@@ -90,7 +91,7 @@ def _feature_tokenize(
     return tokens
 
 
-class TextMultiField(RawField):
+class TextMultiField(TorchtextRawField):
     """Container for subfields.
 
     Text data might use POS/NER/etc labels in addition to tokens.
@@ -119,57 +120,105 @@ class TextMultiField(RawField):
     def base_field(self):
         return self.fields[0][1]
 
-    def process(self, batch, device=None):
-        """Convert outputs of preprocess into Tensors.
-
-        Args:
-            batch (List[List[List[str]]]): A list of length batch size.
-                Each element is a list of the preprocess results for each
-                field (which are lists of str "words" or feature tags.
-            device (torch.device or str): The device on which the tensor(s)
-                are built.
-
-        Returns:
-            torch.LongTensor or Tuple[LongTensor, LongTensor]:
-                A tensor of shape ``(seq_len, batch_size, len(self.fields))``
-                where the field features are ordered like ``self.fields``.
-                If the base field returns lengths, these are also returned
-                and have shape ``(batch_size,)``.
-        """
-
-        # batch (list(list(list))): batch_size x len(self.fields) x seq_len
-        batch_by_feat = list(zip(*batch))
-        base_data = self.base_field.process(batch_by_feat[0], device=device)
-        if self.base_field.include_lengths:
-            # lengths: batch_size
-            base_data, lengths = base_data
-
-        feats = [ff.process(batch_by_feat[i], device=device)
-                 for i, (_, ff) in enumerate(self.fields[1:], 1)]
-        levels = [base_data] + feats
-        # data: seq_len x batch_size x len(self.fields)
-        data = torch.stack(levels, 2)
-        if self.base_field.include_lengths:
-            return data, lengths
-        else:
-            return data
-
     def preprocess(self, x):
-        """Preprocess data.
+        # x is a list of lists: [[base_toks], [feat1_toks], ...]
+        return [f.preprocess(x_i) for (name, f), x_i in zip(self.fields, x)]
 
-        Args:
-            x (str): A sentence string (words joined by whitespace).
+    def pad(self, examples_data):
+        # examples_data: list of what ex.src returns, so:
+        # [[ex1_base_preprocessed, ex1_f1_preprocessed,...], [ex2_base_preprocessed, ex2_f1_preprocessed,...], ...]
+        # We need to transpose it to:
+        # [[ex1_base_preprocessed, ex2_base_preprocessed,...], [ex1_f1_preprocessed, ex2_f1_preprocessed,...], ...]
+        # Each inner list is then passed to the corresponding sub-field's pad method.
+        
+        padded_by_field = []
+        # Transpose examples_data
+        # Number of fields (base + features)
+        num_sub_fields = len(self.fields)
+        # For each sub-field, gather all examples' data for that sub-field
+        for i in range(num_sub_fields):
+            data_for_sub_field = [ex_data_list[i] for ex_data_list in examples_data]
+            _name, field_obj = self.fields[i]
+            # field_obj is an onmt.inputters.inputter.Field
+            # Its pad method expects a list of sequences and returns padded list (or (padded_list, lengths_list))
+            # We only care about the padded list here, lengths are handled by base_field in .process()
+            padded_output_for_sub_field = field_obj.pad(data_for_sub_field)
+            if field_obj.include_lengths: # if pad returns (padded_list, lengths_list)
+                padded_by_field.append(padded_output_for_sub_field[0]) # Just take the padded list
+            else:
+                padded_by_field.append(padded_output_for_sub_field)
+        return padded_by_field # list of lists: [[padded_base_toks_for_all_ex], [padded_feat1_toks_for_all_ex], ...]
 
-        Returns:
-            List[List[str]]: A list of length ``len(self.fields)`` containing
-                lists of tokens/feature tags for the sentence. The output
-                is ordered like ``self.fields``.
+    def numericalize(self, padded_data_by_field, device=None):
+        # padded_data_by_field is output of self.pad:
+        # [[all_padded_base_tokens], [all_padded_feat1_tokens], ...]
+        numericalized_tensors = []
+        for i in range(len(self.fields)):
+            _name, field_obj = self.fields[i] # onmt.inputters.inputter.Field
+            data_for_sub_field_tensorization = padded_data_by_field[i]
+            
+            # field_obj.numericalize expects padded list (or (padded_list, lengths) if include_lengths)
+            # But our .pad() method for TextMultiField ensures it only passes the padded_list.
+            # So, we pass include_lengths=False effectively to sub-field.numericalize here,
+            # because lengths handling is centralized in .process() for the base_field.
+            # This is a bit of a simplification. Let's stick to calling field_obj.numericalize directly.
+            # If field_obj.include_lengths, its numericalize will return (tensor, lengths_tensor).
+            # We'll only use the tensor for stacking.
+            
+            processed_output = field_obj.numericalize(data_for_sub_field_tensorization, device=device)
+            if field_obj.include_lengths:
+                numericalized_tensors.append(processed_output[0]) # Just the tensor
+            else:
+                numericalized_tensors.append(processed_output)
+        return numericalized_tensors # list of tensors [base_tensor, feat1_tensor, ...]
+
+    def process(self, batch_data, device=None):
         """
+        Process a list of examples' data for this TextMultiField.
+        batch_data: List of data for this field from each example.
+                    Each item is a list [base_item, feat1_item, ...].
+        """
+        # 1. Preprocess each example's data (applies to base and all features)
+        #    Input to TextMultiField.preprocess is one example's data: [base_raw, feat1_raw, ...]
+        #    Output is [base_preprocessed, feat1_preprocessed, ...]
+        preprocessed_batch_data = [self.preprocess(ex_data) for ex_data in batch_data]
 
-        return [f.preprocess(x) for _, f in self.fields]
+        # 2. Extract data for base field and process it (including lengths if specified)
+        base_field_raw_list = [ex_preprocessed_data[0] for ex_preprocessed_data in preprocessed_batch_data]
+        base_processed_output = self.base_field.process(base_field_raw_list, device=device)
 
-    def __getitem__(self, item):
-        return self.fields[item]
+        lengths = None
+        if self.base_field.include_lengths:
+            base_tensor_for_stacking = base_processed_output[0]
+            lengths = base_processed_output[1]
+        else:
+            base_tensor_for_stacking = base_processed_output
+        
+        # 3. Process each feature field
+        feature_tensors_for_stacking = []
+        for i in range(1, len(self.fields)): # Start from 1 for features
+            _feat_name, feat_field = self.fields[i]
+            # Extract raw data for this feature from all examples in the batch
+            feat_field_raw_list = [ex_preprocessed_data[i] for ex_preprocessed_data in preprocessed_batch_data]
+            # Feature fields usually have include_lengths=False.
+            # Their .process() will just return the tensor.
+            processed_feat_tensor = feat_field.process(feat_field_raw_list, device=device)
+            if feat_field.include_lengths: # Should typically be false for features
+                 feature_tensors_for_stacking.append(processed_feat_tensor[0])
+            else:
+                 feature_tensors_for_stacking.append(processed_feat_tensor)
+            
+        # 4. Stack base tensor and feature tensors
+        levels_to_stack = [base_tensor_for_stacking] + feature_tensors_for_stacking
+        # Ensure all tensors are 2D (seq_len, batch) before stacking on a new dim.
+        # Or if batch_first, (batch, seq_len).
+        # The Field.process should ensure this.
+        stacked_data = torch.stack(levels_to_stack, 2) # (seq_len, batch, n_fields) or (batch, seq_len, n_fields)
+
+        if lengths is not None: # i.e., self.base_field.include_lengths was true
+            return stacked_data, lengths
+        else:
+            return stacked_data
 
 
 def text_fields(**kwargs):
