@@ -3,64 +3,118 @@ import glob
 import os
 import codecs
 import math
-import random # For OrderedIterator shuffler
 
 from collections import Counter, defaultdict
 from itertools import chain, cycle
 
 import torch
-# import torchtext # No longer needed for Batch import
-# from torchtext.legacy.data import Batch # REMOVE THIS IMPORT
+import torchtext
+import random
 from torch.nn.utils.rnn import pad_sequence
 
 # Disable torchtext deprecation warning
 import warnings
 warnings.filterwarnings('ignore', message='.*torchtext.*')
 
-# Custom Batch class definition
-class CustomBatch:
-    def __init__(self, examples_list, dataset, device=None):
-        """
-        Create a Batch from a list of examples.
+class Batch(object):
+    """Defines a batch of examples along with its Fields.
 
-        Args:
-            examples_list (list): A list of onmt.inputters.dataset_base.Example objects.
-            dataset (onmt.inputters.inputter.Dataset): The dataset object that
-                provides access to Field definitions (dataset.fields).
-            device (torch.device or str): The device to create tensors on.
-        """
-        if not examples_list:
-            self.batch_size = 0
-            self.examples = [] # Keep attribute for compatibility
-            # Other attributes like src, tgt would be absent or None.
-            # This case should ideally be handled by the iterator not yielding empty lists.
-            return
+    Attributes:
+        batch_size: Number of examples in the batch.
+        dataset: A reference to the dataset object the examples come from
+            (which itself contains the dataset's Field objects).
+        train: Deprecated: this attribute is left for backwards compatibility,
+            however it is UNUSED as of the merger with pytorch 0.4.
+        input_fields: The names of the fields that are used as input for the model
+        target_fields: The names of the fields that are used as targets during
+                       model training
 
-        self.examples = examples_list
-        self.batch_size = len(examples_list)
-        self.dataset = dataset # Retain for reference if needed, like torchtext.legacy.data.Batch
+    Also stores the Variable for each column in the batch as an attribute.
+    """
 
-        for (name, field_obj) in dataset.fields.items():
-            # field_obj is an instance of onmt.inputters.inputter.Field or onmt.inputters.text_dataset.TextMultiField
-            # Both should now have a .process() method.
-            if not hasattr(field_obj, 'process') or not callable(field_obj.process):
-                # Log a warning if a field doesn't have a process method, though it should not happen with current setup.
-                # from témoin.util.logging import logger # (cannot import here)
-                # print(f"Warning: Field {name} does not have a callable process method. Skipping.")
-                continue
+    def __init__(self, data=None, dataset=None, device=None):
+        """Create a Batch from a list of examples."""
+        warnings.warn('{} class will be retired soon and moved to torchtext.legacy. Please see the most recent release notes for further information.'.format(self.__class__.__name__), UserWarning)
+        if data is not None:
+            self.batch_size = len(data)
+            self.dataset = dataset
+            self.fields = dataset.fields.keys()  # copy field names
+            self.input_fields = [k for k, v in dataset.fields.items() if
+                                 v is not None and not v.is_target]
+            self.target_fields = [k for k, v in dataset.fields.items() if
+                                  v is not None and v.is_target]
 
-            # Extract the raw data for this field from all examples in the list
-            # getattr(ex, name) should return the data corresponding to this field for one example
-            raw_field_data_list = [getattr(ex, name) for ex in examples_list]
+            for (name, field) in dataset.fields.items():
+                if field is not None:
+                    batch = [getattr(x, name) for x in data]
+                    setattr(self, name, field.process(batch, device=device))
 
-            # Use the Field object's process method to preprocess, pad, and numericalize this list of raw data
-            processed_data = field_obj.process(raw_field_data_list, device=device)
-            setattr(self, name, processed_data)
+    @classmethod
+    def fromvars(cls, dataset, batch_size, train=None, **kwargs):
+        """Create a Batch directly from a number of Variables."""
+        batch = cls()
+        batch.batch_size = batch_size
+        batch.dataset = dataset
+        batch.fields = dataset.fields.keys()
+        for k, v in kwargs.items():
+            setattr(batch, k, v)
+        return batch
 
-        # Note: Unlike torchtext.legacy.data.Batch, we are not creating .input_fields or .target_fields attributes.
-        # Also, a more direct `src_lengths` attribute isn't created here if `src` is a tuple.
-        # Models using this batch must access lengths like: `src, src_lengths = batch.src` if `isinstance(batch.src, tuple)`.
-        # This is consistent with common practice in OpenNMT-py.
+
+    def __repr__(self):
+        return str(self)
+
+    def __str__(self):
+        if not self.__dict__:
+            return 'Empty {} instance'.format(torch.typename(self))
+
+        fields_to_index = filter(lambda field: field is not None, self.fields)
+        var_strs = '\n'.join(['\t[.' + name + ']' + ":" + _short_str(getattr(self, name))
+                              for name in fields_to_index if hasattr(self, name)])
+
+        data_str = (' from {}'.format(self.dataset.name.upper())
+                    if hasattr(self.dataset, 'name')
+                    and isinstance(self.dataset.name, str) else '')
+
+        strt = '[{} of size {}{}]\n{}'.format(torch.typename(self),
+                                              self.batch_size, data_str, var_strs)
+        return '\n' + strt
+
+    def __len__(self):
+        return self.batch_size
+
+    def _get_field_values(self, fields):
+        if len(fields) == 0:
+            return None
+        elif len(fields) == 1:
+            return getattr(self, fields[0])
+        else:
+            return tuple(getattr(self, f) for f in fields)
+
+    def __iter__(self):
+        yield self._get_field_values(self.input_fields)
+        yield self._get_field_values(self.target_fields)
+
+def _short_str(tensor):
+    # unwrap variable to tensor
+    if not torch.is_tensor(tensor):
+        # (1) unpack variable
+        if hasattr(tensor, 'data'):
+            tensor = getattr(tensor, 'data')
+        # (2) handle include_lengths
+        elif isinstance(tensor, tuple):
+            return str(tuple(_short_str(t) for t in tensor))
+        # (3) fallback to default str
+        else:
+            return str(tensor)
+
+    # copied from torch _tensor_str
+    size_str = 'x'.join(str(size) for size in tensor.size())
+    device_str = '' if not tensor.is_cuda else \
+        ' (GPU {})'.format(tensor.get_device())
+    strt = '[{} of size {}{}]'.format(torch.typename(tensor),
+                                      size_str, device_str)
+    return strt
 
 # Create Field class replacement
 class Field:
@@ -710,86 +764,72 @@ class OrderedIterator(object):
                  batch_size_multiple=1,
                  train=True,
                  repeat=False,
-                 sort=None, # outer sort of batches
-                 sort_within_batch=None, # sort examples within a batch
+                 sort=None,
+                 sort_within_batch=None,
                  sort_key=None,
                  random_shuffler=None):
         self.dataset = dataset
-        # self.fields = dataset.fields # CustomBatch will access this via dataset argument
+        self.fields = dataset.fields
         self.batch_size = batch_size
         self.batch_size_multiple = batch_size_multiple
         self.device = device
         self.train = train
         self.repeat = repeat
-        self.sort = sort # Kept for potential future use, though current create_batches sorts data source once.
+        self.sort = sort
         self.sort_within_batch = sort_within_batch
         self.sort_key = sort_key
         if random_shuffler is None:
-            # Ensure random is imported at the top of the file
-            self.random_shuffler = random.Random().shuffle 
+            self.random_shuffler = random.Random().shuffle
         else:
             self.random_shuffler = random_shuffler
         self.batches = None
         self._iter = None
 
     def data(self):
-        """Return the examples in the dataset, potentially sorted."""
-        # Sorting the entire dataset can be memory intensive for large datasets.
-        # Torchtext's iterators often sort pools of data.
-        # For now, this simplified sorting matches the previous edited version.
-        if self.sort_key and (self.train or self.sort): # Sort if training with key, or if sort=True explicitly
-            return sorted(self.dataset, key=self.sort_key)
+        if self.train:
+            if self.sort_key is None:
+                return self.dataset
+            else:
+                return sorted(self.dataset, key=self.sort_key)
         else:
-            return self.dataset # just an iterable of examples
+            if self.sort_key is None:
+                return self.dataset
+            else:
+                return sorted(self.dataset, key=self.sort_key)
 
     def create_batches(self):
-        if self.batches is not None: # Only create batches once
+        if self.batches is not None:
             return
         self.batches = []
-        data_source = self.data() # Get (potentially sorted) examples from dataset
-        
-        current_batch_size_fn = None
-        if hasattr(self.dataset, 'batch_size_fn') and callable(self.dataset.batch_size_fn):
-             current_batch_size_fn = self.dataset.batch_size_fn
-        elif hasattr(self, 'batch_size_fn') and callable(self.batch_size_fn):
-            # Fallback if it was attached to iterator directly (less common for ONMT setup)
-            current_batch_size_fn = self.batch_size_fn
-
-        for b_list in batch_iter( # b_list is a list of Example objects
+        data_source = self.data()
+        for b_list in batch_iter(
                 data_source,
                 self.batch_size,
-                batch_size_fn=current_batch_size_fn, # Use the batch_size_fn from dataset if available
+                batch_size_fn=self.batch_size_fn if hasattr(self, 'batch_size_fn') else None,
                 batch_size_multiple=self.batch_size_multiple):
 
-            if b_list: # Ensure the list is not empty
-                # Sort examples within the batch if specified
+            if b_list:
                 if self.sort_within_batch and self.sort_key is not None:
-                    b_list.sort(key=self.sort_key) # Sort in-place
-                
-                # Create a CustomBatch object
-                self.batches.append(CustomBatch(b_list, self.dataset, self.device))
+                    b_list = sorted(b_list, key=self.sort_key)
+                self.batches.append(Batch(b_list, self.dataset, self.device))
 
     @property
     def epoch(self):
-        # This was an alias. Keeping for compatibility if anything used it.
         return self._iter
 
     def __len__(self):
-        if self.batches is None:
-            self.create_batches() # Ensure batches are created
+        self.create_batches()
         return len(self.batches)
 
     def __iter__(self):
-        if self.batches is None:
-            self.create_batches() # Ensure batches are created
-        
-        # Shuffle the list of Batch objects if training
-        if self.train and self.random_shuffler is not None:
-            self.random_shuffler(self.batches)
-            
+        self.create_batches()
         if self.train and self.repeat:
+            if self.random_shuffler is not None:
+                self.random_shuffler(self.batches)
             self._iter = cycle(self.batches)
         else:
+            if self.train and self.random_shuffler is not None:
+                 self.random_shuffler(self.batches)
             self._iter = iter(self.batches)
         return self._iter
 
