@@ -593,7 +593,6 @@ class Translator(object):
         # (0) Prep the components of the search.
         use_src_map = self.copy_attn
         beam_size = self.beam_size
-        print(batch, batch.__dir__())
         batch_size = batch.batch_size
 
         # (1) Run the encoder on the src.
