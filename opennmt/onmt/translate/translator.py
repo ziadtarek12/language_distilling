@@ -295,7 +295,9 @@ class Translator(object):
             train=False,
             sort=False,
             sort_within_batch=True,
-            shuffle=False
+            # Remove the 'shuffle' parameter and use 'random_shuffler' instead 
+            # which is what OrderedIterator actually accepts
+            random_shuffler=None
         )
 
         xlation_builder = onmt.translate.TranslationBuilder(
