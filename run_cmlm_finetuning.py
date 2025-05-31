@@ -438,39 +438,53 @@ def accuracy_count(out, labels):
 
 
 def save_training_meta(opts):
+    # Create output directory and subdirectories if they don't exist
     if not exists(opts.output_dir):
-        os.makedirs(join(opts.output_dir, 'log'))
-        os.makedirs(join(opts.output_dir, 'ckpt'))
+        os.makedirs(opts.output_dir, exist_ok=True)
+    
+    log_dir = join(opts.output_dir, 'log')
+    ckpt_dir = join(opts.output_dir, 'ckpt')
+    
+    if not exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    
+    if not exists(ckpt_dir):
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-    with open(join(opts.output_dir, 'log', 'hps.json'), 'w') as writer:
+    # Save hyperparameters
+    hps_file = join(log_dir, 'hps.json')
+    with open(hps_file, 'w') as writer:
         hps = copy.deepcopy(vars(opts))
-        del hps['local_rank']
+        if 'local_rank' in hps:
+            del hps['local_rank']
         json.dump(hps, writer, indent=4)
+    
     # git info
     try:
         logger.info("Waiting on git info....")
         c = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                           timeout=10, stdout=subprocess.PIPE)
+                           timeout=10, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         git_branch_name = c.stdout.decode().strip()
         logger.info("Git branch: %s", git_branch_name)
         c = subprocess.run(["git", "rev-parse", "HEAD"],
-                           timeout=10, stdout=subprocess.PIPE)
+                           timeout=10, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         git_sha = c.stdout.decode().strip()
         logger.info("Git SHA: %s", git_sha)
         git_dir = abspath(dirname(__file__))
         git_status = subprocess.check_output(
             ['git', 'status', '--short'],
             cwd=git_dir, universal_newlines=True).strip()
-        with open(join(opts.output_dir, 'log', 'git_info.json'),
-                  'w') as writer:
+        
+        git_info_file = join(log_dir, 'git_info.json')
+        with open(git_info_file, 'w') as writer:
             json.dump({'branch': git_branch_name,
                        'is_dirty': bool(git_status),
                        'status': git_status,
                        'sha': git_sha},
                       writer, indent=4)
-    except subprocess.TimeoutExpired as e:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.exception(e)
-        logger.warn("Git info not found. Moving right along...")
+        logger.warning("Git info not found. Moving right along...")
 
 
 if __name__ == "__main__":
