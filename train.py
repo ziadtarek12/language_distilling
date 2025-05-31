@@ -83,8 +83,7 @@ def main():
             print("Error: 'language_distilling' directory not found. Please clone the repository first.")
             sys.exit(1)
             
-    run_shell_command(["git", "checkout", "eval"])
-
+    
 
     print("\n--- Installing Python packages (if needed) ---")
     packages_to_install = [
