@@ -552,8 +552,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if exists(args.output_dir) and os.listdir(args.output_dir):
-        raise ValueError("Output directory ({}) already exists and is not "
-                         "empty.".format(args.output_dir))
+    
 
     main(args)
