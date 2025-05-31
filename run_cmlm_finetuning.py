@@ -70,7 +70,7 @@ def main():
                       help="Token bucket size")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                       help="Learning rate")
-    parser.add_argument("--num_train_steps", default=5000, type=int,
+    parser.add_argument("--num_train_steps", default=10, type=int,
                       help="Number of training steps")
     parser.add_argument("--warmup_proportion", default=0.1, type=float,
                       help="Warmup proportion")
@@ -178,101 +178,78 @@ def main():
     model.to(device)
     logger.info(f"Model adapted with vocabulary size: {model.config.vocab_size}")
     
-    # Create optimizer
-    logger.info("Setting up optimizer")
+    # Training parameters
+    learning_rate = args.learning_rate
+    warmup_proportion = args.warmup_proportion
+    max_steps = 100000  # Full training uses 100k steps
+    num_steps_to_run = args.num_train_steps
+    
+    # Optimizer using modern AdamW from transformers
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer
-                   if not any(nd in n for nd in no_decay)],
+                    if not any(nd in n for nd in no_decay)],
          'weight_decay': 0.01},
         {'params': [p for n, p in param_optimizer
-                   if any(nd in n for nd in no_decay)],
+                    if any(nd in n for nd in no_decay)],
          'weight_decay': 0.0}
     ]
-    
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(args.warmup_proportion * args.num_train_steps),
-        num_training_steps=args.num_train_steps
+        num_warmup_steps=int(max_steps * warmup_proportion),
+        num_training_steps=max_steps
     )
     
     # Training loop
-    logger.info("Starting training")
-    global_step = 0
     running_loss = RunningMeter('loss')
     model.train()
     
-    progress_bar = tqdm(total=args.num_train_steps, desc="Training")
+    logger.info("Starting CMLM fine-tuning...")
+    train_iter = iter(train_loader)
+    for step in range(num_steps_to_run):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            # Restart iterator if we run out of batches
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+            
+        # Move batch to device
+        batch = tuple(t.to(device) for t in batch)
+        input_ids, input_mask, segment_ids, lm_label_ids = batch
+        
+        # Zero gradients
+        optimizer.zero_grad()
+        
+        # Create output mask from lm_label_ids for model forward pass
+        output_mask = lm_label_ids != -1  # Masking for non-padded tokens
+        
+        # Forward pass with output_mask parameter
+        loss = model(input_ids, segment_ids, input_mask, lm_label_ids, output_mask)
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        
+        running_loss(loss.item())
+        logger.info(f"Step {step}, Loss: {running_loss.val:.4f}")
+        
+        if step % 10 == 0:
+            TB_LOGGER.add_scalar('loss', running_loss.val, step)
+            TB_LOGGER.step()
+            
+        if step % 100 == 0:
+            # Clear CUDA cache periodically to avoid memory issues
+            torch.cuda.empty_cache()
     
-    while global_step < args.num_train_steps:
-        for batch in train_loader:
-            if global_step >= args.num_train_steps:
-                break
-                
-            # Move batch to device
-            batch = tuple(t.to(device) if t is not None else t for t in batch)
-            input_ids, input_mask, segment_ids, lm_label_ids = batch
-            
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass
-            mask = lm_label_ids != -1
-            loss = model(input_ids, segment_ids, input_mask,
-                         lm_label_ids, mask, True)
-            
-            # Backward pass
-            loss.backward()
-            
-            # Update weights
-            optimizer.step()
-            scheduler.step()
-            
-            # Track loss
-            running_loss(loss.item())
-            
-            # Increment step counter
-            global_step += 1
-            
-            # Update progress bar
-            progress_bar.update(1)
-            progress_bar.set_postfix(loss=f"{running_loss.val:.4f}")
-            
-            # Log to tensorboard
-            if global_step % 10 == 0:
-                TB_LOGGER.add_scalar('loss', running_loss.val, global_step)
-                TB_LOGGER.add_scalar('lr', scheduler.get_last_lr()[0], global_step)
-                TB_LOGGER.step()
-            
-            # Save checkpoint
-            if global_step % args.valid_steps == 0:
-                logger.info(f"Saving model at step {global_step}")
-                output_model_file = join(
-                    args.output_dir, 'ckpt',
-                    f"model_step_{global_step}.pt"
-                )
-                # Save CPU checkpoint
-                state_dict = {k: v.cpu() if isinstance(v, torch.Tensor)
-                             else v
-                             for k, v in model.state_dict().items()}
-                torch.save(state_dict, output_model_file)
-                logger.info(f"Model saved to {output_model_file}")
-    
-    # Save final model
-    logger.info(f"Training completed. Saving final model")
-    output_model_file = join(
-        args.output_dir, 'ckpt',
-        f"model_final.pt"
-    )
-    state_dict = {k: v.cpu() if isinstance(v, torch.Tensor)
-                 else v
-                 for k, v in model.state_dict().items()}
-    torch.save(state_dict, output_model_file)
-    logger.info(f"Final model saved to {output_model_file}")
-    
-    logger.info("Training complete!")
+    # Save model checkpoint
+    logger.info("Training complete, saving model...")
+    output_model_file = f"{args.output_dir}/model_step_{num_steps_to_run}.pt"
+    torch.save(model.state_dict(), output_model_file)
+    logger.info(f"Model saved to {output_model_file}")
 
 if __name__ == "__main__":
     main()
