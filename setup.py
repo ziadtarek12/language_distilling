@@ -59,7 +59,7 @@ def install_dependencies():
         "pytorch-pretrained-bert",
         "cytoolz",
         "tqdm",
-        "shelve-utils",
+        "shelve",
         "datasets",
         "matplotlib",
         "pyyaml",
@@ -69,7 +69,8 @@ def install_dependencies():
         "torchvision==0.16.0",
         "torchaudio==2.1.0",
         "ipdb",
-        "tensorboardX"
+        "tensorboardX",
+        "configargparse"
     ]
     
     for dep in dependencies:
