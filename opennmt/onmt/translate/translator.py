@@ -412,7 +412,7 @@ class Translator(object):
 
         batch_size = batch.batch_size
 
-        # Encoder forward.
+        # Encoder forward
         src, enc_states, memory_bank, src_lengths = self._run_encoder(batch)
         self.model.decoder.init_state(src, memory_bank, enc_states)
 
