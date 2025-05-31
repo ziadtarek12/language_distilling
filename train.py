@@ -1,24 +1,209 @@
+This output is very informative!
+
+Here's what we're seeing:
+
+Initializing BertKdDataset with data_db: data/DEEN.db, bert_dump: output/bert_dump
+
+Found 160239 keys in corpus database (This is data/DEEN.db from Stage 1 - good, it has data)
+
+Found 10 keys in topk database (This is output/bert_dump/topk from Stage 2 - this matches your --max_samples_extraction 10 during the debug run of Stage 2, which is correct for debug mode).
+
+Found 10 common keys between databases (Excellent, all top-k samples have corresponding entries in the main DB).
+
+Using 10 examples after filtering by length constraints (The max_len=150 in BertKdDataset didn't filter out any of these 10 debug samples).
+
+Length of KD train dataset (train_dataset_kd.keys): 10 (The BertKdDataset object correctly identifies 10 usable samples).
+
+CRITICAL ERROR: KD DataLoader is empty. Cannot proceed with KD training. (This is the problem).
+
+The BertKdDataset itself seems to be initialized correctly and finds 10 valid samples. The issue arises when this dataset is passed to the DataLoader via the BertKdTokenBucketSampler.
+
+Possible reasons for the DataLoader being empty even if the dataset has items:
+
+BertKdTokenBucketSampler Issue:
+
+The sampler might be filtering out all 10 samples based on its bucketing logic or batch size constraints.
+
+The bucket_size (8192) or batch_size (6144 tokens, not samples) might be too large for only 10 short samples, resulting in no complete batches being formed.
+
+The TokenBucketSampler tries to create batches that are roughly batch_size tokens long. If all 10 samples combined are much shorter than 6144 tokens, and no single sample is long enough to form a batch on its own (which is unlikely if batch_multiple=1), it might not yield any batches.
+
+Interaction between BertKdDataset.keys and BertKdTokenBucketSampler:
+
+The sampler takes train_dataset_kd.keys as input. If these keys are somehow not what the sampler expects or if the lengths associated with these keys (which the sampler uses internally, though not explicitly passed in this constructor) are all zero or problematic, it could fail. However, BertKdDataset seems to be okay.
+
+Let's try to debug the BertKdTokenBucketSampler interaction:
+
+Hypothesis: The batch_size of 6144 tokens is too large for a tiny dataset of 10 samples. The sampler might not be able to form even a single batch.
+
+Proposed Change:
+When in debug mode (i.e., when max_samples_extraction is small, leading to a small KD dataset), let's drastically reduce the batch_size for the BertKdTokenBucketSampler.
+
+We can make the BUCKET_SIZE_KD and batch_size_tokens_kd dynamic based on the number of samples.
+
+Modified code for Stage 3 DataLoader setup:
+
+# In Stage 3, after BertKdDataset is initialized and train_dataset_kd.keys is available
+
+        print(f"Length of KD train dataset (train_dataset_kd.keys): {len(train_dataset_kd.keys)}")
+        if not train_dataset_kd.keys:
+            print("CRITICAL ERROR: KD train dataset (train_dataset_kd.keys) is empty!")
+            sys.exit(1)
+
+        # --- Dynamic Sampler Parameters for Small Datasets ---
+        num_kd_samples = len(train_dataset_kd.keys)
+        if num_kd_samples <= 0: # Should have been caught above, but defensive check
+            print("CRITICAL ERROR: num_kd_samples is 0, cannot proceed.")
+            sys.exit(1)
+
+        # Default sampler parameters from the notebook
+        BUCKET_SIZE_KD_default = 8192
+        batch_size_tokens_kd_default = 6144 # This is in TOKENS
+
+        # Adjust for very small datasets (e.g., during debug)
+        if num_kd_samples < 50: # Arbitrary threshold for "very small"
+            # For very few samples, make batch size in tokens smaller to ensure batches can form
+            # Let's aim for batches of a few samples. Assume average seq_len ~50-100 tokens.
+            # If 10 samples, maybe batch_size_tokens_kd = 10 samples * 75 tokens/sample = 750
+            # Or simply, ensure each sample can form its own batch if needed.
+            # The sampler aims to make batches of `batch_size_tokens_kd` tokens.
+            # If we have 10 samples, let's try to make a few batches.
+            print(f"KD dataset is very small ({num_kd_samples} samples). Adjusting sampler parameters.")
+            
+            # Smallest effective bucket: just enough to hold all samples if we make one big batch.
+            # Or, keep bucket size reasonable but reduce batch token target.
+            BUCKET_SIZE_KD = min(BUCKET_SIZE_KD_default, num_kd_samples * 200) # Ensure bucket can hold a few max-length samples
+            if BUCKET_SIZE_KD < num_kd_samples: # Ensure bucket can hold all samples if very few
+                 BUCKET_SIZE_KD = num_kd_samples * 256 # Max seq len ~150-200
+
+            # Max tokens per batch: make it small enough so a few samples can form a batch.
+            # e.g., if 10 samples, target 2-3 samples per batch.
+            # Max length is 150. So, 3*150 = 450 tokens.
+            batch_size_tokens_kd = min(batch_size_tokens_kd_default, num_kd_samples * 150) # Max tokens could be total tokens in dataset
+            # More aggressively, ensure even 1-2 samples can form a batch
+            batch_size_tokens_kd = min(batch_size_tokens_kd, 3 * 150) # e.g., target 3 max-length samples
+
+            # Ensure batch_size_tokens_kd is not ridiculously small, e.g., less than one max-length sentence.
+            batch_size_tokens_kd = max(batch_size_tokens_kd, 150 * 1) # At least one max-length sample
+
+            print(f"Adjusted BUCKET_SIZE_KD: {BUCKET_SIZE_KD}")
+            print(f"Adjusted batch_size_tokens_kd (target tokens per batch): {batch_size_tokens_kd}")
+        else:
+            BUCKET_SIZE_KD = BUCKET_SIZE_KD_default
+            batch_size_tokens_kd = batch_size_tokens_kd_default
+        
+        # batch_multiple=1 means batch size in samples can be anything.
+        # The sampler primarily uses batch_size_tokens_kd to form batches.
+        train_sampler_kd = BertKdTokenBucketSampler(
+            train_dataset_kd.keys,  # This should be a list of (key, src_len, tgt_len)
+                                    # Let's verify what train_dataset_kd.keys actually is.
+                                    # The original notebook used dataset.keys which was just the string IDs.
+                                    # The sampler might need lengths. Let's look at BertKdDataset.
+            bucket_size=BUCKET_SIZE_KD, 
+            batch_size=batch_size_tokens_kd, # Target number of TOKENS per batch
+            batch_multiple=1 # Batches can have any number of SAMPLES (must be >=1)
+        )
+        
+        # BertKdDataset.keys is a list of string IDs.
+        # The TokenBucketSampler in OpenNMT (onmt/inputters/inputter.py)
+        # expects `data` to be an iterable of examples, where each example has a `src` and `tgt`
+        # attribute, and it calculates lengths from these.
+        # OR, if `data` is a list of tuples (id, src_len, tgt_len), it can use that.
+        # The BertKdTokenBucketSampler might have a different expectation if it's custom.
+
+        # The notebook `language_distilling/onmt/inputters/bert_kd_dataset.py` defines:
+        # class TokenBucketSampler(Sampler):
+        #   def __init__(self, keys, bucket_size, batch_size, batch_multiple=1):
+        #       self.batch_size = batch_size # This is the token-based batch size
+        #       self.id_lens = {key: (self.db[key]['src_len'], self.db[key]['tgt_len'])
+        #                       for key in keys} # THIS IS THE PROBLEM! It re-opens the DB.
+        # It seems BertKdDataset.keys is just a list of string IDs.
+        # The TokenBucketSampler defined *within* bert_kd_dataset.py expects to be able to access
+        # self.db from the dataset to get lengths. This is bad design (sampler depending on dataset internals).
+
+        # Let's look at the TokenBucketSampler used by BertKdDataset:
+        # It's `from onmt.inputters.bert_kd_dataset import BertKdDataset, TokenBucketSampler as BertKdTokenBucketSampler`
+        # Inside `language_distilling/onmt/inputters/bert_kd_dataset.py`:
+        # class TokenBucketSampler(Sampler):
+        #     def __init__(self, id_lens, bucket_size, batch_size, batch_multiple=1):
+        #         self.id_lens = id_lens # <--- EXPECTS A DICT of {key: (src_len, tgt_len)}
+        #         self.bucket_size = bucket_size
+        #         self.batch_size = batch_size
+        #         # ... rest of init
+        #     def __iter__(self):
+        #         ids = list(self.id_lens.keys()) # Uses keys from id_lens
+        #         # ... uses self.id_lens[idx] to get lengths
+
+        # So, `train_dataset_kd.keys` (which is `list(self.ids)`) is NOT what this sampler expects.
+        # It expects `train_dataset_kd.id_lens`.
+
+        # --- CORRECT SAMPLER INITIALIZATION ---
+        if not hasattr(train_dataset_kd, 'id_lens') or not train_dataset_kd.id_lens:
+            print("CRITICAL ERROR: train_dataset_kd.id_lens is missing or empty. Sampler cannot be initialized.")
+            sys.exit(1)
+
+        print(f"Initializing BertKdTokenBucketSampler with id_lens containing {len(train_dataset_kd.id_lens)} entries.")
+        train_sampler_kd = BertKdTokenBucketSampler(
+            train_dataset_kd.id_lens, # Pass the dictionary of id -> (src_len, tgt_len)
+            bucket_size=BUCKET_SIZE_KD, 
+            batch_size=batch_size_tokens_kd, 
+            batch_multiple=1
+        )
+        # --- END CORRECT SAMPLER INITIALIZATION ---
+
+
+        train_loader_kd = DataLoader(train_dataset_kd, batch_sampler=train_sampler_kd,
+                                  num_workers=min(4, os.cpu_count() or 1),
+                                  collate_fn=BertKdDataset.pad_collate)
+        
+        try:
+            _first_batch_kd_check = next(iter(train_loader_kd))
+            print(f"KD DataLoader can produce at least one batch. Batch check successful.")
+            del _first_batch_kd_check
+        except StopIteration:
+            print("CRITICAL ERROR: KD DataLoader is empty. Cannot proceed with KD training.")
+            print(f"  Dataset samples: {num_kd_samples}")
+            print(f"  Sampler bucket_size: {BUCKET_SIZE_KD}")
+            print(f"  Sampler batch_size (tokens): {batch_size_tokens_kd}")
+            print(f"  Sampler id_lens items: {len(train_dataset_kd.id_lens) if hasattr(train_dataset_kd, 'id_lens') else 'N/A'}")
+            # Further debug: print some (id, lens) from train_dataset_kd.id_lens
+            if hasattr(train_dataset_kd, 'id_lens') and train_dataset_kd.id_lens:
+                print("  Sample (id, (src_len, tgt_len)) from id_lens (first 5):")
+                for i, (k, v) in enumerate(train_dataset_kd.id_lens.items()):
+                    if i >= 5: break
+                    print(f"    {k}: {v}")
+            sys.exit(1)
+            
+        iter_state = {'train_iter_kd': cycle_loader(train_loader_kd, device)}
+
+
+The critical fix identified:
+
+The TokenBucketSampler defined in onmt/inputters/bert_kd_dataset.py expects its first argument to be id_lens, which is a dictionary mapping sample IDs to their (src_len, tgt_len).
+Your script was passing train_dataset_kd.keys (a list of string IDs).
+
+The BertKdDataset class itself prepares an self.id_lens dictionary during its __init__. This is the correct structure to pass to the sampler.
+
+By changing:
+train_sampler_kd = BertKdTokenBucketSampler(train_dataset_kd.keys, ...)
+to
+train_sampler_kd = BertKdTokenBucketSampler(train_dataset_kd.id_lens, ...)
+the sampler should now get the length information it needs correctly.
+
+The dynamic adjustment of BUCKET_SIZE_KD and batch_size_tokens_kd is also a good heuristic for handling very small (debug) datasets, as the default token-based batch size (6144) is likely too large for 10 samples.
+
+Let's integrate this into the full script.
 
 import os
 import sys
-import torch
-import numpy as np
-import random
-import shelve
-import io
-import argparse # Ensure argparse is imported
-import yaml
-from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
-import tensorboardX
 import subprocess
-import torch.nn as nn
-import traceback
-import matplotlib.pyplot as plt
-import dbm # For DBM diagnostics
+import argparse
+# import yaml # Will defer this as PyYAML is installed by the script
+import shutil # For potentially deleting directories/files if needed for clean runs
 
-# Imports from the repository's scripts/modules are deferred until sys.path is set
+# Placeholder for imports that will happen inside main() after installation
+# This is mostly for human readability or if you were to use type hints extensively
+# For this script, we can skip explicit placeholders and just import inside main()
 
 def run_shell_command(command, **kwargs):
     """Helper function to run shell commands."""
@@ -27,7 +212,7 @@ def run_shell_command(command, **kwargs):
         process = subprocess.run(command, check=True, text=True, capture_output=True, **kwargs)
         if process.stdout:
             print("Stdout:\n", process.stdout)
-        if process.stderr:
+        if process.stderr: # Print stderr even for non-erroring commands for more info
             print("Stderr:\n", process.stderr)
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {' '.join(command) if isinstance(command, list) else command}")
@@ -59,32 +244,60 @@ def main():
     if not os.path.exists("language_distilling"):
         run_shell_command(["git", "clone", "https://github.com/ziadtarek12/language_distilling"])
     
-    if os.path.basename(os.getcwd()) != "language_distilling":
+    current_dir_name = os.path.basename(os.getcwd())
+    if current_dir_name != "language_distilling":
         if os.path.exists("language_distilling"):
             os.chdir("language_distilling")
             print(f"Changed directory to: {os.getcwd()}")
         else:
-            print("Error: 'language_distilling' directory not found. Please clone the repository first.")
+            print("Error: 'language_distilling' directory not found. Please clone the repository first and run from its parent or inside it.")
             sys.exit(1)
             
-    run_shell_command(["git", "checkout", "eval"])
+    run_shell_command(["git", "checkout", "eval"]) # Ensure on correct branch
 
+    # --- Package Installation Block ---
     print("\n--- Installing Python packages (if needed) ---")
     packages_to_install = [
         "transformers==4.26.0", "pytorch-pretrained-bert", "cytoolz", "tqdm",
         "torchtext==0.16.0", "torchvision==0.16.0", "torch==2.1.0", "torchaudio==2.1.0",
-        "configargparse", "tensorboardX", "PyYAML"
+        "configargparse", "tensorboardX", "PyYAML", "matplotlib"
     ]
     for package_spec in packages_to_install:
         package_name = package_spec.split('==')[0]
+        module_to_import = package_name 
+        if package_name == "pytorch-pretrained-bert": module_to_import = "pytorch_pretrained_bert"
+        if package_name == "PyYAML": module_to_import = "yaml"
+        
         try:
-            __import__(package_name if package_name != "pytorch-pretrained-bert" else "pytorch_pretrained_bert")
+            __import__(module_to_import)
         except ImportError:
             print(f"Installing {package_spec}...")
             run_shell_command([sys.executable, "-m", "pip", "install", package_spec])
+    print("Package check/installation complete.")
 
-    sys.path.append('.')
-    sys.path.append('./opennmt')
+    # --- Deferred Imports ---
+    import torch
+    import numpy as np
+    import random
+    import shelve
+    import io
+    import yaml 
+    from tqdm import tqdm 
+    from torch.utils.data import Dataset, DataLoader 
+    from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
+    import torch.nn as nn
+    import traceback
+    import matplotlib.pyplot as plt
+    import dbm 
+
+    script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+    if script_dir not in sys.path: 
+        sys.path.insert(0, script_dir)
+    opennmt_dir_relative = "opennmt" # Relative to script_dir (language_distilling)
+    opennmt_dir_abs = os.path.join(script_dir, opennmt_dir_relative)
+    if opennmt_dir_abs not in sys.path:
+        sys.path.insert(0, opennmt_dir_abs)
+
 
     from scripts.bert_tokenize import tokenize, process as bert_tokenize_process
     from scripts.bert_prepro import main as bert_prepro_main
@@ -94,11 +307,18 @@ def main():
     from vocab_loader import safe_load_vocab
     from dump_teacher_hiddens import tensor_dumps, BertSampleDataset, batch_features, process_batch as dump_process_batch
     from dump_teacher_topk import tensor_loads, dump_topk
+    # Corrected OpenNMT imports assuming 'opennmt_dir_abs' now correctly points to the folder *containing* the 'onmt' package
+    # The structure is language_distilling/opennmt/onmt/...
+    # So, if opennmt_dir_abs = ".../language_distilling/opennmt", then imports should be "onmt. ..."
+    # If sys.path has ".../language_distilling/opennmt", then from onmt...
+    # If sys.path has ".../language_distilling", then from opennmt.onmt... (if opennmt is a package)
+    # Given the notebook structure, it's likely opennmt_dir_abs is ".../language_distilling/opennmt" which contains the "onmt" package.
+    # So `sys.path.insert(0, opennmt_dir_abs)` makes `onmt` importable.
     from onmt.inputters.bert_kd_dataset import BertKdDataset, TokenBucketSampler as BertKdTokenBucketSampler
-    from onmt.utils.optimizers import Optimizer
-    from onmt.train_single import build_model_saver, build_trainer, cycle_loader
-    from onmt.model_builder import build_model
-    import onmt.utils
+    from onmt.utils.optimizers import Optimizer 
+    from onmt.train_single import build_model_saver, build_trainer, cycle_loader 
+    from onmt.model_builder import build_model 
+    import onmt.utils 
 
     SEED = 42; random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED); device = torch.device('cuda')
@@ -129,10 +349,11 @@ def main():
     output_path_kd = "output/kd-model"
     num_steps_to_run_kd = cli_args.num_steps_kd
     kd_model_checkpoint_path = f"{output_path_kd}/ckpt/model_step_{num_steps_to_run_kd}.pt"
-    db_output_file = 'data/DEEN.db' # Defined early for use in multiple stages
+    db_output_file = 'data/DEEN.db'
 
     if cli_args.run_stage1:
         print("\n--- Stage 1: CMLM Fine-tuning ---")
+        # ... (Stage 1 code as in previous correct version - assuming it's fine now) ...
         print("\n--- BERT Tokenization & Preprocessing ---")
         for language in ['de', 'en']:
             for split in ['train', 'valid', 'test']:
@@ -160,16 +381,23 @@ def main():
             else: print("Continuing to other stages, but they will likely fail due to missing CMLM data.")
         else:
             db_exists_and_valid = False
-            if os.path.exists(f"{db_output_file}.dat"):
+            shelve_files_exist = any(os.path.exists(f"{db_output_file}{ext}") for ext in ['', '.db', '.dat', '.bak', '.dir'])
+            if shelve_files_exist:
                  try:
                     with shelve.open(db_output_file, 'r') as temp_db_check:
                         if list(temp_db_check.keys()):
                             print(f"{db_output_file} exists with {len(list(temp_db_check.keys()))} entries.")
                             db_exists_and_valid = True
                         else: print(f"WARNING: {db_output_file} exists but is empty! Will attempt to regenerate.")
-                 except Exception as e:
-                     print(f"WARNING: Could not open existing {db_output_file} ({e}). Will attempt to regenerate.")
-                     for ext in ['.bak', '.dat', '.dir', '']:
+                 except dbm.error as e_dbm: 
+                     print(f"WARNING: Could not open existing {db_output_file} due to DBM error ({e_dbm}). Will attempt to regenerate.")
+                     for ext in ['.bak', '.dat', '.dir', '']: 
+                        if os.path.exists(f"{db_output_file}{ext}"):
+                            try: os.remove(f"{db_output_file}{ext}")
+                            except OSError: pass
+                 except Exception as e_other: 
+                     print(f"WARNING: Could not open existing {db_output_file} ({e_other}). Will attempt to regenerate.")
+                     for ext in ['.bak', '.dat', '.dir', '']: 
                         if os.path.exists(f"{db_output_file}{ext}"):
                             try: os.remove(f"{db_output_file}{ext}")
                             except OSError: pass
@@ -191,7 +419,9 @@ def main():
         vocab_file_onmt = "data/DEEN.vocab.pt"
         if not os.path.exists(vocab_file_onmt):
             print("Creating vocabulary files with OpenNMT preprocess.py...")
-            opennmt_preprocess_cmd = [sys.executable, "opennmt/preprocess.py", "-train_src", train_de_bert, "-train_tgt", train_en_bert, "-valid_src", f"{data_dir}/valid.de.bert", "-valid_tgt", f"{data_dir}/valid.en.bert", "-save_data", "data/DEEN", "-src_seq_length", "150", "-tgt_seq_length", "150"]
+            # Construct full path to opennmt scripts using opennmt_dir_abs
+            opennmt_script_path = os.path.join(opennmt_dir_abs, "preprocess.py")
+            opennmt_preprocess_cmd = [sys.executable, opennmt_script_path, "-train_src", train_de_bert, "-train_tgt", train_en_bert, "-valid_src", f"{data_dir}/valid.de.bert", "-valid_tgt", f"{data_dir}/valid.en.bert", "-save_data", "data/DEEN", "-src_seq_length", "150", "-tgt_seq_length", "150"]
             run_shell_command(opennmt_preprocess_cmd)
         else: print(f"Skipping OpenNMT vocab creation, {vocab_file_onmt} exists.")
 
@@ -200,18 +430,16 @@ def main():
         vocab_stoi = vocab_dump['tgt'].fields[0][1].vocab.stoi
         print(f"Initializing BertDataset with DB: {db_output_file}")
         try:
-            print(f"Attempting to open shelve file '{db_output_file}' with standard shelve.open (read-only for test)")
-            with shelve.open(db_output_file, 'r') as test_shelf:
-                print(f"Successfully opened with standard shelve. Keys: {len(list(test_shelf.keys()))}")
-        except dbm.error as e:
+            with shelve.open(db_output_file, 'r') as test_shelf: # Test read
+                print(f"Successfully opened shelve DB '{db_output_file}' for read test. Keys: {len(list(test_shelf.keys()))}")
+        except dbm.error as e: # Catch dbm.error for more specific feedback
             print(f"Standard shelve.open failed for '{db_output_file}' with dbm.error: {e}")
-            try:
-                import dbm.dumb; print("Imported dbm.dumb.")
-                with dbm.dumb.open(db_output_file, 'r') as dumb_db: print(f"Successfully opened directly with dbm.dumb.open.")
+            try: import dbm.dumb; print("Imported dbm.dumb. DBM issues might relate to backend availability or file format.")
             except ImportError: print("Could not import dbm.dumb.")
-            except Exception as dumb_e: print(f"Opening directly with dbm.dumb.open also failed: {dumb_e}")
             print("If DBM errors persist, file might be corrupted or environment lacks DBM backends. Consider deleting .db files to force regeneration.")
-        
+        except Exception as e_gen: # Catch any other shelve open error
+            print(f"General error opening shelve DB '{db_output_file}': {e_gen}")
+
         train_dataset_cmlm = BertDataset(db_output_file, tokenizer, vocab_stoi, seq_len=512, max_len=150)
         print(f"Length of CMLM train dataset (train_dataset_cmlm.lens): {len(train_dataset_cmlm.lens)}")
         if not train_dataset_cmlm.lens: print("CRITICAL ERROR: CMLM train dataset (train_dataset_cmlm.lens) is empty!"); sys.exit(1)
@@ -258,6 +486,7 @@ def main():
 
     if cli_args.run_stage2:
         print("\n--- Stage 2: Teacher Hidden States and Top-K Logits ---")
+        # ... (Stage 2 code as in previous correct version) ...
         if not os.path.exists(cmlm_model_save_path): print(f"Error: CMLM model {cmlm_model_save_path} not found. Cannot proceed with Stage 2."); sys.exit(1)
         print("\n--- Loading fine-tuned CMLM model for Stage 2 ---")
         bert_teacher_model = BertForSeq2seq.from_pretrained(bert_model_name).eval().to(device)
@@ -297,7 +526,8 @@ def main():
             except Exception: print(f"Hidden states DB found at ~{hidden_states_db_path} but couldn't be opened/verified. Will re-run extraction.")
         if not skip_extraction:
             print("\n--- Extracting hidden states ---")
-            if not (os.path.exists(f"{db_output_file}.dat") or os.path.exists(f"{db_output_file}.db")): print(f"ERROR: Source DB for hidden state extraction {db_output_file} not found. Cannot extract hidden states."); sys.exit(1)
+            shelve_db_for_extraction_exists = any(os.path.exists(f"{db_output_file}{ext}") for ext in ['', '.db', '.dat', '.bak', '.dir'])
+            if not shelve_db_for_extraction_exists: print(f"ERROR: Source DB for hidden state extraction {db_output_file} not found. Cannot extract hidden states."); sys.exit(1)
             with shelve.open(hidden_states_db_path, 'c') as out_db, torch.no_grad():
                 build_db_batched_local(db_output_file, out_db, bert_teacher_model, tokenizer, batch_size=8, debug_mode_local=debug_mode_extraction, max_samples_local=max_samples_extraction)
             print(f"Hidden states extraction completed. DB at {hidden_states_db_path}")
@@ -339,7 +569,8 @@ def main():
 
     if cli_args.run_stage3:
         print("\n--- Stage 3: Knowledge Distillation Training ---")
-        required_stage2_files_ok = True
+        required_stage2_files_ok = True # Assume true initially
+        # ... (checks for required_stage2_files_ok as before) ...
         if not os.path.exists(linear_projection_layer_path): print(f"Error: Linear projection layer {linear_projection_layer_path} from Stage 2 not found."); required_stage2_files_ok = False
         hidden_db_found_nonempty = False
         if any(os.path.exists(f"{hidden_states_db_path}{ext}") for ext in [".db", ".dat", ".dir", ".bak", ""]):
@@ -357,7 +588,7 @@ def main():
         if not topk_db_found_nonempty: print(f"Error: Top-K DB ~{topk_db_path} from Stage 2 not found or empty."); required_stage2_files_ok = False
         if not required_stage2_files_ok: print(f"Cannot proceed with Stage 3 due to missing/empty files from Stage 2."); sys.exit(1)
 
-        config_path_kd = "opennmt/config/config-transformer-base-mt-deen.yml"
+        config_path_kd = os.path.join(opennmt_dir_abs, "config", "config-transformer-base-mt-deen.yml")
         with open(config_path_kd, 'r') as stream: config_kd = yaml.safe_load(stream)
         args_kd = argparse.Namespace(**config_kd)
         default_num_layers = 6
@@ -374,61 +605,90 @@ def main():
         args_kd.feat_merge = "concat"; args_kd.feat_vec_size = -1; args_kd.feat_vec_exponent = 0.7
         args_kd.pre_word_vecs_enc = None; args_kd.pre_word_vecs_dec = None
         args_kd.fix_word_vecs_enc = False; args_kd.fix_word_vecs_dec = False
-        args_kd.enc_rnn_size = args_kd.rnn_size; args_kd.dec_rnn_size = args_kd.rnn_size
+        args_kd.enc_rnn_size = getattr(args_kd, 'rnn_size', 512); args_kd.dec_rnn_size = getattr(args_kd, 'rnn_size', 512) 
         args_kd.transformer_ff = getattr(args_kd, 'transformer_ff', 2048)
         args_kd.heads = getattr(args_kd, 'heads', 8)
-        args_kd.max_relative_positions = 0; args_kd.position_encoding = True
-        args_kd.param_init = 0.0; args_kd.param_init_glorot = True
+        args_kd.max_relative_positions = getattr(args_kd, 'max_relative_positions', 0)
+        args_kd.position_encoding = getattr(args_kd, 'position_encoding', True)
+        args_kd.param_init = getattr(args_kd, 'param_init', 0.0)
+        args_kd.param_init_glorot = getattr(args_kd, 'param_init_glorot', True)
         args_kd.share_embeddings = False; args_kd.share_decoder_embeddings = False
-        args_kd.truncated_decoder = 0
+        args_kd.truncated_decoder = getattr(args_kd, 'truncated_decoder', 0)
         args_kd.max_generator_batches = getattr(args_kd, 'max_generator_batches', 32)
         args_kd.normalization = getattr(args_kd, 'normalization', 'sents')
         args_kd.accum_count = getattr(args_kd, 'accum_count', [1])
         if not isinstance(args_kd.accum_count, list): args_kd.accum_count = [args_kd.accum_count]
-        args_kd.accum_steps = getattr(args_kd, 'accum_steps', [0])
-        args_kd.average_decay = 0.0; args_kd.average_every = 1
+        args_kd.accum_steps = getattr(args_kd, 'accum_steps', [0]) # from notebook; OpenNMT might expect alignment with accum_count
+        args_kd.average_decay = getattr(args_kd, 'average_decay', 0.0)
+        args_kd.average_every = getattr(args_kd, 'average_every', 1)
         args_kd.valid_steps = cli_args.kd_valid_steps
-        args_kd.early_stopping = 0; args_kd.early_stopping_criteria = None
-        args_kd.valid_batch_size = getattr(args_kd, 'valid_batch_size', 8)
-        args_kd.self_attn_type = "scaled-dot"; args_kd.input_feed = 1
-        args_kd.copy_attn_type = None; args_kd.generator_function = "softmax"
+        args_kd.early_stopping = getattr(args_kd, 'early_stopping', 0)
+        args_kd.early_stopping_criteria = getattr(args_kd, 'early_stopping_criteria', None)
+        args_kd.valid_batch_size = getattr(args_kd, 'valid_batch_size', 8) # from notebook
+        args_kd.self_attn_type = getattr(args_kd, 'self_attn_type', "scaled-dot")
+        args_kd.input_feed = getattr(args_kd, 'input_feed', 1) if getattr(args_kd, 'decoder_type', "transformer") == "rnn" else 0
+        args_kd.copy_attn_type = getattr(args_kd, 'copy_attn_type', None)
+        args_kd.generator_function = getattr(args_kd, 'generator_function', "softmax")
         args_kd.local_rank = -1; args_kd.gpu_ranks = [0] if torch.cuda.is_available() else []
         args_kd.gpu_verbose_level = 0; args_kd.world_size = 1
         args_kd.encoder_type = getattr(args_kd, 'encoder_type', "transformer")
         args_kd.decoder_type = getattr(args_kd, 'decoder_type', "transformer")
-        
-        # --- CORRECTED DROPOUT HANDLING for Stage 3 ---
         args_kd.dropout = float(getattr(args_kd, 'dropout', 0.1)) 
         args_kd.attention_dropout = float(getattr(args_kd, 'attention_dropout', args_kd.dropout))
-        # If other dropout types like copy_attn_dropout are used by your config, ensure they are floats too
-        # args_kd.copy_attn_dropout = float(getattr(args_kd, 'copy_attn_dropout', args_kd.dropout))
-
-
-        args_kd.bridge = ""; args_kd.aux_tune = False
+        args_kd.bridge = getattr(args_kd, 'bridge', False) 
+        args_kd.aux_tune = False
         args_kd.subword_prefix = " "; args_kd.subword_prefix_is_joiner = False
         args_kd.save_model = os.path.join(output_path_kd, 'ckpt', 'model')
         args_kd.log_file = os.path.join(output_path_kd, 'log', 'log.txt')
         args_kd.tensorboard = True; args_kd.tensorboard_log_dir = os.path.join(output_path_kd, 'log')
 
         print("\n--- Loading vocabulary and dataset for KD ---")
-        vocab_onmt = torch.load(args_kd.data + '.vocab.pt')
+        vocab_onmt_path = args_kd.data + '.vocab.pt'
+        if not os.path.exists(vocab_onmt_path): print(f"ERROR: Vocab file {vocab_onmt_path} not found for KD stage."); sys.exit(1)
+        vocab_onmt = torch.load(vocab_onmt_path)
         src_vocab_kd = vocab_onmt['src'].fields[0][1].vocab; tgt_vocab_kd = vocab_onmt['tgt'].fields[0][1].vocab
         print(f"Initializing BertKdDataset with data_db: {args_kd.data_db}, bert_dump: {args_kd.bert_dump}")
         train_dataset_kd = BertKdDataset(args_kd.data_db, args_kd.bert_dump, src_vocab_kd.stoi, tgt_vocab_kd.stoi, max_len=150, k=args_kd.kd_topk)
-        print(f"Length of KD train dataset (train_dataset_kd.keys): {len(train_dataset_kd.keys)}")
-        if not train_dataset_kd.keys: print("CRITICAL ERROR: KD train dataset (train_dataset_kd.keys) is empty!"); sys.exit(1)
-        train_sampler_kd = BertKdTokenBucketSampler(train_dataset_kd.keys, 8192, 6144, batch_multiple=1)
+        
+        num_kd_samples = len(train_dataset_kd.id_lens if hasattr(train_dataset_kd, 'id_lens') else []) # Use id_lens length
+        print(f"Length of KD train dataset (train_dataset_kd.id_lens): {num_kd_samples}") # Adjusted to print from id_lens
+        if not num_kd_samples > 0 : print("CRITICAL ERROR: KD train dataset (train_dataset_kd.id_lens) is effectively empty!"); sys.exit(1)
+
+        BUCKET_SIZE_KD_default = 8192; batch_size_tokens_kd_default = 6144
+        if num_kd_samples < 50: 
+            print(f"KD dataset is very small ({num_kd_samples} samples). Adjusting sampler parameters.")
+            BUCKET_SIZE_KD = min(BUCKET_SIZE_KD_default, num_kd_samples * 256) 
+            BUCKET_SIZE_KD = max(BUCKET_SIZE_KD, num_kd_samples) # Ensure bucket can at least hold all samples if extremely few
+            batch_size_tokens_kd = min(batch_size_tokens_kd_default, num_kd_samples * 150) 
+            batch_size_tokens_kd = max(batch_size_tokens_kd, 150 * 1) 
+            print(f"Adjusted BUCKET_SIZE_KD: {BUCKET_SIZE_KD}"); print(f"Adjusted batch_size_tokens_kd (target tokens per batch): {batch_size_tokens_kd}")
+        else: BUCKET_SIZE_KD = BUCKET_SIZE_KD_default; batch_size_tokens_kd = batch_size_tokens_kd_default
+        
+        if not hasattr(train_dataset_kd, 'id_lens') or not train_dataset_kd.id_lens:
+            print("CRITICAL ERROR: train_dataset_kd.id_lens is missing or empty. Sampler cannot be initialized."); sys.exit(1)
+        print(f"Initializing BertKdTokenBucketSampler with id_lens containing {len(train_dataset_kd.id_lens)} entries.")
+        train_sampler_kd = BertKdTokenBucketSampler(train_dataset_kd.id_lens, bucket_size=BUCKET_SIZE_KD, batch_size=batch_size_tokens_kd, batch_multiple=1)
+        
         train_loader_kd = DataLoader(train_dataset_kd, batch_sampler=train_sampler_kd, num_workers=min(4, os.cpu_count() or 1), collate_fn=BertKdDataset.pad_collate)
         try:
             _first_batch_kd_check = next(iter(train_loader_kd)); print(f"KD DataLoader can produce at least one batch. Batch check successful."); del _first_batch_kd_check
-        except StopIteration: print("CRITICAL ERROR: KD DataLoader is empty. Cannot proceed with KD training."); sys.exit(1)
+        except StopIteration:
+            print("CRITICAL ERROR: KD DataLoader is empty. Cannot proceed with KD training.")
+            print(f"  Dataset samples: {num_kd_samples}"); print(f"  Sampler bucket_size: {BUCKET_SIZE_KD}"); print(f"  Sampler batch_size (tokens): {batch_size_tokens_kd}")
+            print(f"  Sampler id_lens items: {len(train_dataset_kd.id_lens) if hasattr(train_dataset_kd, 'id_lens') else 'N/A'}")
+            if hasattr(train_dataset_kd, 'id_lens') and train_dataset_kd.id_lens:
+                print("  Sample (id, (src_len, tgt_len)) from id_lens (first 5):")
+                for i, (k, v) in enumerate(train_dataset_kd.id_lens.items()):
+                    if i >= 5: break
+                    print(f"    {k}: {v}")
+            sys.exit(1)
         iter_state = {'train_iter_kd': cycle_loader(train_loader_kd, device)}
 
         print("\n--- Building OpenNMT model, optimizer, and trainer for KD ---")
         onmt_fields = {'src': vocab_onmt['src'], 'tgt': vocab_onmt['tgt']}
-        model_kd = build_model(args_kd, args_kd, fields=onmt_fields, checkpoint=None).to(device) # Pass args_kd as model_opt
+        model_kd = build_model(args_kd, args_kd, fields=onmt_fields, checkpoint=None).to(device) 
         optim_kd = Optimizer.from_opt(model_kd, args_kd, checkpoint=None)
-        args_kd.report_every = getattr(args_kd, 'report_every', 50)
+        args_kd.report_every = int(getattr(args_kd, 'report_every', 50))
         if args_kd.tensorboard:
             from tensorboardX import SummaryWriter
             writer = SummaryWriter(args_kd.tensorboard_log_dir, comment="unmt"); args_kd.report_manager = onmt.utils.ReportMgr(report_every=args_kd.report_every, start_time=None, tensorboard_writer=writer)
@@ -456,11 +716,13 @@ def main():
 
     if cli_args.run_stage4:
         print("\n--- Stage 4: Translation and Evaluation ---")
+        # ... (Stage 4 code as in previous correct version) ...
         if not os.path.exists(kd_model_checkpoint_path): print(f"Error: KD model {kd_model_checkpoint_path} not found. Cannot proceed with Stage 4."); sys.exit(1)
         out_dir_translate = "output/translation"; os.makedirs(out_dir_translate, exist_ok=True)
         print(f"Model found at {kd_model_checkpoint_path}. Running translation...")
         try:
-            translate_cmd = [sys.executable, "opennmt/translate.py", "-model", kd_model_checkpoint_path, "-src", f"{data_dir}/test.de.bert", "-output", f"{out_dir_translate}/result.en", "-beam_size", "5", "-alpha", "0.6", "-length_penalty", "wu"]
+            translate_script_path = os.path.join(opennmt_dir_abs, "translate.py")
+            translate_cmd = [sys.executable, translate_script_path, "-model", kd_model_checkpoint_path, "-src", f"{data_dir}/test.de.bert", "-output", f"{out_dir_translate}/result.en", "-beam_size", "5", "-alpha", "0.6", "-length_penalty", "wu"]
             if torch.cuda.is_available(): translate_cmd.extend(["-gpu", "0"])
             run_shell_command(translate_cmd); result_en_file = f"{out_dir_translate}/result.en"
             if os.path.exists(result_en_file):
@@ -469,9 +731,10 @@ def main():
                 result_en_detok_file = f"{out_dir_translate}/result.en.detok"
                 if os.path.exists(result_en_detok_file):
                     print("Evaluating with BLEU score...")
+                    bleu_script_path = os.path.join(opennmt_dir_abs, "tools", "multi-bleu.perl")
                     bleu_output_file = f"{out_dir_translate}/result.bleu"; ref_file_translate = f"{data_dir}/test.en"
                     with open(result_en_detok_file, 'r', encoding='utf-8') as infile, open(bleu_output_file, 'w', encoding='utf-8') as outfile:
-                        run_shell_command(["perl", "opennmt/tools/multi-bleu.perl", ref_file_translate], stdin=infile, stdout=outfile)
+                        run_shell_command(["perl", bleu_script_path, ref_file_translate], stdin=infile, stdout=outfile) 
                     if os.path.exists(bleu_output_file):
                         with open(bleu_output_file, "r", encoding='utf-8') as f: print(f"BLEU Score: {f.read().strip()}")
                     else: print("Warning: BLEU score file was not generated.")
@@ -482,11 +745,12 @@ def main():
 
     if cli_args.run_stage5:
         print("\n--- Stage 5: Displaying Figures (if available) ---")
+        # ... (Stage 5 code as in previous correct version) ...
         figures_to_display = {'CMLM Finetuning': 'figures/cmlm-finetuning.png', 'Translation Losses': 'figures/translation-losses.png', 'Translation Accuracy': 'figures/translation-accuracy.png'}
         existing_figures = {title: path for title, path in figures_to_display.items() if os.path.exists(path)}
         if existing_figures:
             num_figs = len(existing_figures); fig, axes = plt.subplots(1, num_figs, figsize=(6 * num_figs, 5))
-            if num_figs == 1: axes = [axes]
+            if num_figs == 1: axes = [axes] # Ensure axes is iterable
             for i, (title, path) in enumerate(existing_figures.items()):
                 axes[i].set_title(title)
                 try: axes[i].imshow(plt.imread(path)); axes[i].axis('off')
@@ -495,9 +759,16 @@ def main():
             try: plt.show(); print("Displayed figures. Close plot window to continue.")
             except Exception as e: print(f"Could not show plots (e.g., no GUI): {e}")
         else: print("No figures found in 'figures/' directory. Skipping display.")
+
     else: print("Skipping Stage 5: Display Figures.")
 
     print("\n--- Script execution finished ---")
 
 if __name__ == "__main__":
     main()
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
