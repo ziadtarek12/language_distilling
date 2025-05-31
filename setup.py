@@ -23,23 +23,12 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-import logging
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('setup.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
 
 def run_command(command, description, check=True):
     """Run a shell command with error handling"""
-    logger.info(f"Running: {description}")
-    logger.debug(f"Command: {command}")
+    print(f"Running: {description}")
+    if args.debug:
+        print(f"Command: {command}")
     
     try:
         result = subprocess.run(
@@ -50,20 +39,20 @@ def run_command(command, description, check=True):
             text=True
         )
         
-        if result.stdout:
-            logger.debug(f"Output: {result.stdout}")
-        if result.stderr and result.returncode == 0:
-            logger.debug(f"Warnings: {result.stderr}")
+        if result.stdout and args.debug:
+            print(f"Output: {result.stdout}")
+        if result.stderr and result.returncode == 0 and args.debug:
+            print(f"Warnings: {result.stderr}")
             
         return result
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed: {description}")
-        logger.error(f"Error: {e.stderr}")
+        print(f"Failed: {description}")
+        print(f"Error: {e.stderr}")
         raise
 
 def install_dependencies():
     """Install required Python packages"""
-    logger.info("Installing dependencies...")
+    print("Installing dependencies...")
     
     dependencies = [
         "transformers==4.26.0",
@@ -75,25 +64,22 @@ def install_dependencies():
         "matplotlib",
         "pyyaml",
         "numpy",
-        "torch==2.1.0",
-        "torchvision==0.16.0",
-        "torchaudio==2.1.0",
-        "torchtext=0.16.0",
-        "tensorboardX",
-        "ipdb"
+        "torch",
+        "torchvision",
+        "torchaudio"
     ]
     
     for dep in dependencies:
         try:
             run_command(f"pip install {dep}", f"Installing {dep}")
         except subprocess.CalledProcessError:
-            logger.warning(f"Failed to install {dep}, continuing...")
+            print(f"Failed to install {dep}, continuing...")
     
-    logger.info("Dependencies installation completed")
+    print("Dependencies installation completed")
 
 def create_directories():
     """Create necessary output directories"""
-    logger.info("Creating output directories...")
+    print("Creating output directories...")
     
     directories = [
         "data/",
@@ -107,22 +93,22 @@ def create_directories():
     
     for directory in directories:
         Path(directory).mkdir(parents=True, exist_ok=True)
-        logger.info(f"Created directory: {directory}")
+        print(f"Created directory: {directory}")
 
 def download_dataset():
     """Download and prepare the IWSLT14 dataset"""
-    logger.info("Downloading IWSLT14 German-English dataset...")
+    print("Downloading IWSLT14 German-English dataset...")
     
     # Check if scripts exist
     download_script = "scripts/download-iwslt_deen.sh"
     prepare_script = "scripts/prepare-iwslt_deen.sh"
     
     if not os.path.exists(download_script):
-        logger.error(f"Download script not found: {download_script}")
+        print(f"Download script not found: {download_script}")
         return False
         
     if not os.path.exists(prepare_script):
-        logger.error(f"Prepare script not found: {prepare_script}")
+        print(f"Prepare script not found: {prepare_script}")
         return False
     
     # Make scripts executable
@@ -148,15 +134,15 @@ def download_dataset():
     
     missing_files = [f for f in required_files if not os.path.exists(f)]
     if missing_files:
-        logger.error(f"Missing files after download: {missing_files}")
+        print(f"Missing files after download: {missing_files}")
         return False
     
-    logger.info("Dataset download and preparation completed")
+    print("Dataset download and preparation completed")
     return True
 
 def apply_bert_tokenization():
     """Apply BERT tokenization to the dataset"""
-    logger.info("Applying BERT tokenization...")
+    print("Applying BERT tokenization...")
     
     # Import required modules
     try:
@@ -164,7 +150,7 @@ def apply_bert_tokenization():
         from scripts.bert_tokenize import process
         from transformers import BertTokenizer
     except ImportError as e:
-        logger.error(f"Failed to import required modules: {e}")
+        print(f"Failed to import required modules: {e}")
         return False
     
     # Load BERT tokenizer
@@ -175,7 +161,7 @@ def apply_bert_tokenization():
             do_lower_case='uncased' in bert_model
         )
     except Exception as e:
-        logger.error(f"Failed to load BERT tokenizer: {e}")
+        print(f"Failed to load BERT tokenizer: {e}")
         return False
     
     # Define data directory
@@ -188,31 +174,31 @@ def apply_bert_tokenization():
             output_file = f"{data_dir}/{split}.{language}.bert"
             
             if not os.path.exists(input_file):
-                logger.warning(f"Input file not found: {input_file}")
+                print(f"Input file not found: {input_file}")
                 continue
                 
-            logger.info(f"Tokenizing {input_file} -> {output_file}")
+            print(f"Tokenizing {input_file} -> {output_file}")
             
             try:
                 with open(input_file, 'r', encoding='utf-8') as reader, \
                      open(output_file, 'w', encoding='utf-8') as writer:
                     process(reader, writer, tokenizer)
             except Exception as e:
-                logger.error(f"Failed to tokenize {input_file}: {e}")
+                print(f"Failed to tokenize {input_file}: {e}")
                 return False
     
-    logger.info("BERT tokenization completed")
+    print("BERT tokenization completed")
     return True
 
 def create_training_data():
     """Create training database and vocabulary"""
-    logger.info("Creating training database and vocabulary...")
+    print("Creating training database and vocabulary...")
     
     try:
         sys.path.append('.')
         from scripts.bert_prepro import main as bert_prepro
     except ImportError as e:
-        logger.error(f"Failed to import bert_prepro: {e}")
+        print(f"Failed to import bert_prepro: {e}")
         return False
     
     data_dir = "data/de-en"
@@ -226,9 +212,9 @@ def create_training_data():
     
     try:
         bert_prepro(prepro_args)
-        logger.info("Training database created: data/DEEN.db")
+        print("Training database created: data/DEEN.db")
     except Exception as e:
-        logger.error(f"Failed to create training database: {e}")
+        print(f"Failed to create training database: {e}")
         return False
     
     # Create vocabulary using OpenNMT preprocess
@@ -246,20 +232,20 @@ def create_training_data():
         # Verify vocabulary file was created
         vocab_file = "data/DEEN.vocab.pt"
         if os.path.exists(vocab_file):
-            logger.info(f"Vocabulary file created: {vocab_file}")
+            print(f"Vocabulary file created: {vocab_file}")
         else:
-            logger.error(f"Vocabulary file not created: {vocab_file}")
+            print(f"Vocabulary file not created: {vocab_file}")
             return False
             
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to create vocabulary: {e}")
+        print(f"Failed to create vocabulary: {e}")
         return False
     
     return True
 
 def verify_setup():
     """Verify that all required files are in place"""
-    logger.info("Verifying setup...")
+    print("Verifying setup...")
     
     required_files = [
         "data/DEEN.db",
@@ -284,18 +270,19 @@ def verify_setup():
     missing_dirs = [d for d in required_dirs if not os.path.exists(d)]
     
     if missing_files:
-        logger.error(f"Missing required files: {missing_files}")
+        print(f"Missing required files: {missing_files}")
         return False
         
     if missing_dirs:
-        logger.error(f"Missing required directories: {missing_dirs}")
+        print(f"Missing required directories: {missing_dirs}")
         return False
     
-    logger.info("Setup verification completed successfully")
+    print("Setup verification completed successfully")
     return True
 
 def main():
     """Main setup function"""
+    global args
     parser = argparse.ArgumentParser(description="Setup BERT Knowledge Distillation environment")
     parser.add_argument("--skip-deps", action="store_true", 
                        help="Skip dependency installation")
@@ -306,17 +293,14 @@ def main():
     
     args = parser.parse_args()
     
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    logger.info("Starting BERT Knowledge Distillation setup...")
+    print("Starting BERT Knowledge Distillation setup...")
     
     try:
         # Step 1: Install dependencies
         if not args.skip_deps:
             install_dependencies()
         else:
-            logger.info("Skipping dependency installation")
+            print("Skipping dependency installation")
         
         # Step 2: Create directories
         create_directories()
@@ -324,41 +308,42 @@ def main():
         # Step 3: Download and prepare dataset
         if not args.skip_download:
             if not download_dataset():
-                logger.error("Dataset download failed")
+                print("Dataset download failed")
                 return 1
         else:
-            logger.info("Skipping dataset download")
+            print("Skipping dataset download")
         
         # Step 4: Apply BERT tokenization
         if not apply_bert_tokenization():
-            logger.error("BERT tokenization failed")
+            print("BERT tokenization failed")
             return 1
         
         # Step 5: Create training data
         if not create_training_data():
-            logger.error("Training data creation failed") 
+            print("Training data creation failed") 
             return 1
         
         # Step 6: Verify setup
         if not verify_setup():
-            logger.error("Setup verification failed")
+            print("Setup verification failed")
             return 1
         
-        logger.info("Setup completed successfully!")
-        logger.info("You can now run the training scripts:")
-        logger.info("1. CMLM finetuning: python run_cmlm_finetuning.py [args]")
-        logger.info("2. Knowledge extraction: python dump_teacher_hiddens.py [args]") 
-        logger.info("3. Student training: python opennmt/train.py [args]")
+        print("Setup completed successfully!")
+        print("You can now run the training scripts:")
+        print("1. CMLM finetuning: python run_cmlm_finetuning.py [args]")
+        print("2. Knowledge extraction: python dump_teacher_hiddens.py [args]") 
+        print("3. Student training: python opennmt/train.py [args]")
         
         return 0
         
     except KeyboardInterrupt:
-        logger.info("Setup interrupted by user")
+        print("Setup interrupted by user")
         return 1
     except Exception as e:
-        logger.error(f"Unexpected error during setup: {e}")
-        import traceback
-        logger.debug(traceback.format_exc())
+        print(f"Unexpected error during setup: {e}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
         return 1
 
 if __name__ == "__main__":
