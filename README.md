@@ -1,6 +1,6 @@
 # Distilling BERT for Text Generation 
 
-This repository implements the three-stage approach from the paper ["Distilling Knowledge Learned in BERT for Text Generation"](https://arxiv.org/abs/1911.03829) (ACL 2020) for German-English translation using the IWSLT14 dataset.
+
 
 ## Quick Start
 
